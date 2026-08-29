@@ -2,65 +2,48 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [herdr](https://herdr.dev) panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**herdr-only fork** of [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents),
-which runs sub-agents in tmux panes. See [Why this fork](#why-this-fork).
+**herdr-only.** Fork of [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents)
+— see [Why this fork](#why-this-fork).
+
+## What this version does
+
+Everything below is how sub-agents behave in this extension.
+
+- **Every sub-agent pane is named after the sub-agent.** No hunting through
+  anonymous panes to work out which one is the reviewer.
+- **Panes tile into a grid and stay even.** Each spawn splits the largest pane
+  the extension owns, across that pane's long axis, and a pass afterwards sets
+  the split ratios so the panes come out uniform — six sub-agents land as an
+  exact 3x2. Closing one re-tiles the rest. `MIN_COLS` / `MIN_ROWS` decide when
+  another column would be too narrow and a row is used instead. There is
+  nothing to configure.
+- **An agent can run in a dedicated tab instead of pi's window.** Set
+  `pane-placement: tab` in its definition and its panes tile in their own tab,
+  leaving your working window full-size. Mixed placements run side by side, and
+  the tab cleans itself up when the last sub-agent exits.
+- **herdr shows what each sub-agent is doing.** Panes report `working`,
+  `idle` and `unknown` as they run, so herdr's sidebar, notifications,
+  `agent list` and `agent wait` agree with the status widget — background work
+  is visible without switching to the pane.
+- **Names are predictable.** A sub-agent's name is normalized once to
+  `[a-z][a-z0-9_-]{0,31}` and that one string is the widget row, the pane
+  label, the herdr agent label and the generated filenames.
+- **Sub-agents stay sandboxed.** They launch with `--no-extensions` and an
+  explicit tool allowlist, and nothing about the herdr integration widens that
+  — state is reported by the parent, so herdr never learns a session it could
+  relaunch unsandboxed. See [herdr agent state](#herdr-agent-state).
+
+Requires [herdr](https://herdr.dev); pi must be running in a herdr pane.
 
 ## Why this fork
 
-Upstream is tmux-only: it replaced the original project's multi-multiplexer
-surface layer (cmux, tmux, zellij, WezTerm) with a single 354-line `tmux.ts`.
-This fork swaps that one backend for [herdr](https://herdr.dev), a terminal
-workspace manager built specifically for running coding agents, and keeps the
-substitution at the same seam — `index.ts` makes no multiplexer calls of its
-own, importing nine functions from `herdr.ts` where it used to import them from
-`tmux.ts`.
-
-herdr is not just a different multiplexer to target. Its model knows what an
-agent is, which buys things tmux has no equivalent for:
-
-- **Panes carry the sub-agent's name** (`pane rename`), instead of an anonymous
-  `%12` whose contents you have to read to identify.
-- **Sub-agents can live in a dedicated tab** (`pane-placement: tab`), so a long
-  research run does not carve up the window you are working in.
-- **herdr sees each sub-agent's lifecycle** — `working`, `idle`, `unknown` — so
-  its sidebar, notifications, `agent list` and `agent wait` agree with the
-  status widget, and background work is visible without switching to the pane.
-- **Layout is set numerically, not by named preset.** tmux offered
-  `even-horizontal` and friends; herdr exposes the split tree, so panes tile
-  into an exact grid and re-tile when one exits.
-
-Everything above `herdr.ts` — the async spawn/steer model, the sandboxed tool
+Upstream is tmux-only. This fork targets [herdr](https://herdr.dev), a terminal
+workspace manager built for running coding agents — its panes can be named, its
+splits can be sized numerically, and it tracks agent lifecycle state, which is
+what the behaviour above is built on. The swap sits at upstream's own seam:
+`index.ts` makes no multiplexer calls, importing nine functions from `herdr.ts`.
+Everything above that file — the async spawn/steer model, the sandboxed tool
 allowlist, session modes, the status widget — is upstream's work, unchanged.
-
-## What differs from upstream
-
-Coming from [upstream](https://github.com/amosblomqvist/pi-interactive-subagents),
-this is what changed. The sub-agent model — async spawn, steer-back, session
-modes, the whitelist-only tool sandbox — is unchanged.
-
-| | upstream (tmux) | this fork (herdr) |
-| --- | --- | --- |
-| Requirement | tmux, pi started inside it | herdr, pi started inside it (`HERDR_ENV=1`) |
-| Pane layout | `select-layout even-horizontal` after each spawn/exit | largest-pane split on the long axis, then exact split ratios — a grid, not a row |
-| Layout knob | `SUBAGENT_TMUX_LAYOUT` constant (any named tmux layout) | none; `MIN_COLS` / `MIN_ROWS` floors decide when a column becomes a row |
-| Pane naming | tmux cannot name panes | pane carries the sub-agent's name |
-| Where panes go | always a split of pi's pane | `pane-placement: tab` can send an agent to a dedicated tab instead |
-| Agent state | not reported | `working` / `idle` / `unknown` reported to herdr, so its sidebar, notifications, `agent list` and `agent wait` agree with the widget |
-| Sub-agent names | free-form | canonicalized to `[a-z][a-z0-9_-]{0,31}`; `subagent_message` still accepts the free-form name |
-| Split directions | `left`/`right`/`up`/`down` | herdr splits `right`/`down` only; `left`/`up` collapse onto their axis (used by tests only) |
-
-Two behaviour changes to know about when migrating:
-
-- **A name you pass to `subagent()` comes back normalized** — `"Scout Agent 1"`
-  becomes `scout-agent-1`. That name is what the widget, the pane label and
-  `subagent_message` use; the free-form form still resolves.
-- **The layout constant is gone.** Panes tile into a grid on their own and
-  re-tile when one exits, so there is nothing to configure — see
-  [How it works](#how-it-works) for the floors that decide rows vs columns.
-
-One fix here is not herdr-specific and applies upstream too: a finished
-sub-agent's result was lost if its pane had already been closed, because the
-success path closed the surface unguarded and threw.
 
 ## How it works
 
@@ -75,7 +58,7 @@ success path closed the surface unguarded and threw.
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are tiled into a grid and kept evenly sized. herdr splits the *target pane's* real estate rather than the window's, so each new pane splits the largest pane the extension owns, across that pane's long axis — adding a row once another column would fall below `MIN_COLS`. After every spawn and exit a debounced pass sets each split's ratio so the panes come out uniform (6 subagents tile to an exact 3x2). The floors are `MIN_COLS` / `MIN_ROWS` in `pi-extension/subagents/herdr.ts`.
+Panes are tiled into a grid and kept evenly sized. A split divides the *target pane's* real estate rather than the whole window, so each spawn splits the largest pane the extension owns, across that pane's long axis — adding a row once another column would fall below `MIN_COLS`. After every spawn and exit a debounced pass sets each split's ratio so the panes come out uniform (6 sub-agents tile to an exact 3x2), which also re-tiles the survivors when one exits. The floors are `MIN_COLS` / `MIN_ROWS` in `pi-extension/subagents/herdr.ts`.
 
 Agents that should stay out of the way run in a **dedicated subagent tab** instead of splitting pi's window — set `pane-placement: tab` in the agent definition. The first such sub-agent takes the new tab's root pane and the rest tile inside it; herdr removes the tab on its own once the last one exits. The two placements can be mixed, and each tab is balanced against its own panes.
 
