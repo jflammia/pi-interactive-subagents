@@ -1599,9 +1599,14 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
+        try {
+          summary = readScreen(surface, 200)
+            .replace(/__SUBAGENT_DONE_\d+__/, "")
+            .trimEnd();
+        } catch {
+          // The pane is gone (closed by hand, or reaped with its tab). Fall
+          // through to the exit-code message rather than losing the result.
+        }
       }
 
       if (!summary) {

@@ -96,7 +96,12 @@ function herdrApi(method: string, params: unknown): Promise<any> {
   return new Promise((resolve, reject) => {
     const socketPath = process.env.HERDR_SOCKET_PATH;
     if (!socketPath) return reject(new Error("HERDR_SOCKET_PATH is not set"));
-    const sock = connect(socketPath);
+    // On Windows the local socket is a named pipe, as herdr's own integration
+    // does it. Untested here (macOS), but a plain path cannot work there.
+    const endpoint =
+      process.platform === "win32" ? `\\\\.\\pipe\\${socketPath}` : socketPath;
+
+    const sock = connect(endpoint);
     let buf = "";
     sock.setTimeout(5000, () => sock.destroy(new Error("herdr socket timed out")));
     sock.on("error", reject);
@@ -639,13 +644,20 @@ function readArgs(surface: string, lines: number, source: string): string[] {
 }
 
 /**
- * Close a pane.
+ * Close a pane. Idempotent: closing a pane that is already gone succeeds.
  */
 export function closeSurface(surface: string): void {
   requireHerdr();
   const placement = ownedSurfaces.get(surface) ?? "split";
   ownedSurfaces.delete(surface);
-  herdrCli(["pane", "close", surface]);
+  try {
+    herdrCli(["pane", "close", surface]);
+  } catch {
+    // Already gone — the user closed it, or herdr reaped it along with its
+    // tab. The pane is closed either way, which is all the caller asked for.
+    // Throwing here used to drop a finished subagent into watchSubagent's
+    // error path and lose its result.
+  }
   rebalanceSurfaces(placement);
 }
 

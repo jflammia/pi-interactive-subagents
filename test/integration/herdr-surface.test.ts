@@ -235,6 +235,21 @@ for (const backend of backends) {
       assert.deepEqual(subagentTabs(), []);
     });
 
+    it("closing a surface that is already gone is not an error", async () => {
+      // A user closing a subagent pane by hand used to throw out of the
+      // completion path and lose the finished subagent's result.
+      const surface = createTrackedSurface(env, "vanishing");
+      await sleep(1000);
+      execFileSync("herdr", ["pane", "close", surface], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await sleep(500);
+
+      assert.doesNotThrow(() => closeSurface(surface));
+      untrackSurface(env, surface);
+    });
+
     it("puts a tab-placed surface in its own tab and cleans the tab up", async () => {
       const before = listTabs();
       const first = createTrackedSurface(env, "tab-agent-1", "tab");

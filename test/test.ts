@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
@@ -1212,13 +1212,28 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
+  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+
+    // A bundled tool extension resolves only when it is installed on disk, so
+    // isolate PI_CODING_AGENT_DIR rather than asserting against whatever the
+    // developer happens to have in ~/.pi/agent/extensions.
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      assert.equal(
+        testApi.getToolExtensionPath("web_search"),
+        undefined,
+        "an uninstalled tool extension should not resolve",
+      );
+
+      const installed = join(globalDir, "extensions", "web-search", "index.ts");
+      mkdirSync(dirname(installed), { recursive: true });
+      writeFileSync(installed, "export default {};\n");
+      assert.equal(testApi.getToolExtensionPath("web_search"), installed);
+    });
   });
 
   it("reads pane-placement from an agent definition", async () => {
