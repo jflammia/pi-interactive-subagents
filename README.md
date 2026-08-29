@@ -47,6 +47,14 @@ Spawn several in parallel — they run concurrently and steer results back indep
 
 Panes are tiled into a grid and kept evenly sized. herdr splits the *target pane's* real estate rather than the window's, so each new pane splits the largest pane the extension owns, across that pane's long axis — adding a row once another column would fall below `MIN_COLS`. After every spawn and exit a debounced pass sets each split's ratio so the panes come out uniform (6 subagents tile to an exact 3x2). The floors are `MIN_COLS` / `MIN_ROWS` in `pi-extension/subagents/herdr.ts`.
 
+Agents that should stay out of the way run in a **dedicated subagent tab** instead of splitting pi's window — set `pane-placement: tab` in the agent definition. The first such sub-agent takes the new tab's root pane and the rest tile inside it; herdr removes the tab on its own once the last one exits. The two placements can be mixed, and each tab is balanced against its own panes.
+
+Quitting pi leaves its sub-agent panes standing — they are separate panes — and
+a herdr server restart restores them. A new pi run adopts the existing
+`subagents` tab in its workspace rather than opening a second one; its leftover
+panes are not tracked as ours, so tiling treats them as the user's and works
+around them.
+
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
 ```bash
@@ -143,6 +151,7 @@ You are a specialized agent that does X...
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
+| `pane-placement` | string | `split` (default) tiles the pane in pi's tab; `tab` puts it in a dedicated subagent tab, leaving pi's window full-size |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |

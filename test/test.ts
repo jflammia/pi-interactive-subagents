@@ -1220,6 +1220,39 @@ describe("subagent discovery", () => {
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
 
+  it("reads pane-placement from an agent definition", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "tabbed-agent",
+        ["name: tabbed-agent", "model: anthropic/test", "pane-placement: tab"].join("\n"),
+      );
+      assert.equal(testApi.loadAgentDefaults("tabbed-agent")?.panePlacement, "tab");
+    });
+  });
+
+  it("leaves pane-placement unset when the agent does not ask for one", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "plain-agent",
+        ["name: plain-agent", "model: anthropic/test"].join("\n"),
+      );
+      assert.equal(testApi.loadAgentDefaults("plain-agent")?.panePlacement, undefined);
+    });
+  });
+
+  it("ignores an unrecognized pane-placement rather than inventing one", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "bogus-agent",
+        ["name: bogus-agent", "model: anthropic/test", "pane-placement: window"].join("\n"),
+      );
+      assert.equal(testApi.loadAgentDefaults("bogus-agent")?.panePlacement, undefined);
+    });
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(

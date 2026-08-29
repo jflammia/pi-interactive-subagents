@@ -11,12 +11,16 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import {
   getAvailableBackends,
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
   getFocusedSurface,
+  forgetSubagentTab,
+  listTabs,
+  tabOf,
   untrackSurface,
   sendCommand,
   sendLongCommand,
@@ -169,6 +173,64 @@ for (const backend of backends) {
 
       assert.ok(screen1.includes(`S1_${m1}`), `Surface 1 missing marker. Got:\n${screen1}`);
       assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
+    });
+
+    it("adopts a leftover subagents tab instead of stacking duplicates", async () => {
+      const subagentTabs = () =>
+        JSON.parse(
+          execFileSync("herdr", ["tab", "list"], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }),
+        ).result.tabs.filter((t: any) => t.label === "subagents");
+
+      const first = createTrackedSurface(env, "restart-1", "tab");
+      await sleep(1200);
+      assert.equal(subagentTabs().length, 1);
+
+      // Quitting pi leaves the tab and its panes standing; a fresh run starts
+      // with no module state and must find that tab rather than make another.
+      forgetSubagentTab();
+      const second = createTrackedSurface(env, "restart-2", "tab");
+      await sleep(1200);
+      const tabs = subagentTabs();
+      assert.equal(tabs.length, 1, "still exactly one subagents tab");
+      assert.equal(tabOf(second), tabOf(first), "the second run joined the first tab");
+
+      // Leave no subagents tab behind: herdr drops it with its last pane, and
+      // the next test asserts on how many tabs a spawn adds.
+      closeSurface(first);
+      untrackSurface(env, first);
+      closeSurface(second);
+      untrackSurface(env, second);
+      await sleep(1000);
+      assert.deepEqual(subagentTabs(), []);
+    });
+
+    it("puts a tab-placed surface in its own tab and cleans the tab up", async () => {
+      const before = listTabs();
+      const first = createTrackedSurface(env, "tab-agent-1", "tab");
+      const second = createTrackedSurface(env, "tab-agent-2", "tab");
+      await sleep(1500);
+
+      const subagentTab = tabOf(first);
+      assert.ok(subagentTab, "expected the tab-placed surface to report a tab");
+      assert.equal(tabOf(second), subagentTab, "both tab-placed surfaces share one tab");
+      assert.notEqual(subagentTab, tabOf(process.env.HERDR_PANE_ID!), "and not pi's tab");
+      assert.equal(listTabs().length, before.length + 1, "exactly one tab was added");
+
+      // A real terminal, not just a rect.
+      const marker = uniqueId();
+      sendCommand(second, `echo "TAB_${marker}"`);
+      await waitForScreen(second, new RegExp(`TAB_${marker}`), 20_000, 50);
+
+      closeSurface(first);
+      untrackSurface(env, first);
+      closeSurface(second);
+      untrackSurface(env, second);
+      await sleep(1000);
+      // herdr drops a tab as soon as its last pane closes.
+      assert.deepEqual(listTabs(), before, "the subagent tab went away with its panes");
     });
 
     it("writes output to a file and verifies via surface", async () => {

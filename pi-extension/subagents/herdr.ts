@@ -171,7 +171,8 @@ export function evenSplitRatios(
   return out;
 }
 
-let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+/** One debounce per placement: the two tabs balance independently. */
+const rebalanceTimers = new Map<SurfacePlacement, ReturnType<typeof setTimeout>>();
 
 /**
  * Re-balance the tab so every pane we own is exactly the same size.
@@ -186,25 +187,39 @@ let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
  * pass, and non-fatal throughout: a cosmetic resize must never break spawning
  * or watching.
  */
-function rebalanceSurfaces(): void {
-  if (rebalanceTimer) clearTimeout(rebalanceTimer);
-  rebalanceTimer = setTimeout(() => {
-    rebalanceTimer = null;
-    void (async () => {
-      try {
-        const anchor = process.env.HERDR_PANE_ID;
-        if (!anchor) return;
-        const result = await herdrApi("layout.export", { pane_id: anchor });
-        const root: LayoutNode | undefined = result?.layout?.root;
-        if (!root) return;
-        for (const { path, ratio } of evenSplitRatios(root, isOwned)) {
-          await herdrApi("layout.set_split_ratio", { pane_id: anchor, path, ratio });
+function rebalanceSurfaces(placement: SurfacePlacement): void {
+  const pending = rebalanceTimers.get(placement);
+  if (pending) clearTimeout(pending);
+  rebalanceTimers.set(
+    placement,
+    setTimeout(() => {
+      rebalanceTimers.delete(placement);
+      void (async () => {
+        try {
+          // Any live pane of the target tab anchors the pass: `layout.export`
+          // resolves a pane id to the tab that holds it.
+          const anchor = placement === "tab" ? tabAnchor() : process.env.HERDR_PANE_ID;
+          if (!anchor) return;
+          const result = await herdrApi("layout.export", { pane_id: anchor });
+          const root: LayoutNode | undefined = result?.layout?.root;
+          if (!root) return;
+          for (const { path, ratio } of evenSplitRatios(root, (id) => isOwned(id, placement))) {
+            await herdrApi("layout.set_split_ratio", { pane_id: anchor, path, ratio });
+          }
+        } catch {
+          // Panes may have closed mid-pass; balancing is best-effort.
         }
-      } catch {
-        // Panes may have closed mid-pass; balancing is best-effort.
-      }
-    })();
-  }, 120);
+      })();
+    }, 120),
+  );
+}
+
+/**
+ * Drop the cached subagent-tab id, so the next `tab` placement rediscovers it
+ * the way a freshly started pi process would. Tests only.
+ */
+export function __forgetSubagentTab__(): void {
+  subagentTabId = null;
 }
 
 // ── Surface primitives ──
@@ -219,10 +234,89 @@ const MIN_COLS = 40;
 const MIN_ROWS = 12;
 
 /**
- * Panes this extension created, so tiling only ever re-splits our own real
- * estate and never a pane the user opened alongside us.
+ * Where a subagent's pane goes: `split` carves up the tab pi is running in,
+ * `tab` puts it in a dedicated subagent tab so pi keeps its whole window.
+ * Set per agent via `pane-placement:` in the agent definition.
  */
-const ownedSurfaces = new Set<string>();
+export type SurfacePlacement = "split" | "tab";
+
+/**
+ * Panes this extension created and where each one lives, so tiling only ever
+ * re-splits our own real estate — never a pane the user opened alongside us —
+ * and each tab is balanced against its own panes.
+ */
+const ownedSurfaces = new Map<string, SurfacePlacement>();
+
+/** Label herdr shows on the dedicated subagent tab, and how we recognize it. */
+const SUBAGENT_TAB_LABEL = "subagents";
+
+/**
+ * The dedicated subagent tab, once created. herdr closes a tab as soon as its
+ * last pane closes, so this goes stale on its own; `tabAnchor()` notices and
+ * the next `tab` spawn makes a fresh one.
+ */
+let subagentTabId: string | null = null;
+
+/**
+ * A subagents tab from an earlier run of this extension in pi's workspace.
+ *
+ * Quitting pi leaves its subagent panes and their tab standing (they are
+ * separate panes), and a herdr server restart restores them. Adopting that tab
+ * keeps restarts from stacking up duplicate "subagents" tabs. Its leftover
+ * panes are not ours, so tiling treats them as the user's and works around
+ * them.
+ */
+function findExistingSubagentTab(): string | null {
+  try {
+    const tabs = JSON.parse(herdrCli(["tab", "list"]))?.result?.tabs ?? [];
+    const workspace = process.env.HERDR_WORKSPACE_ID;
+    const match = tabs.find(
+      (t: any) =>
+        t.label === SUBAGENT_TAB_LABEL && (!workspace || t.workspace_id === workspace),
+    );
+    return match?.tab_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** A live pane in the subagent tab, or null when that tab is gone. */
+function tabAnchor(): string | null {
+  if (!subagentTabId) subagentTabId = findExistingSubagentTab();
+  if (!subagentTabId) return null;
+  try {
+    const out = herdrCli(["pane", "list"]);
+    const panes = JSON.parse(out)?.result?.panes ?? [];
+    return panes.find((p: any) => p.tab_id === subagentTabId)?.pane_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Create the dedicated subagent tab. Returns its ready-to-use root pane. */
+function createSubagentTab(): string {
+  // Pin the workspace to pi's own. Without `--workspace`, `tab.create` falls
+  // back to the *focused* workspace (`src/app/api/tabs.rs`), so a subagent
+  // spawned while the user is looking elsewhere would open its tab over there.
+  const workspace = process.env.HERDR_WORKSPACE_ID;
+  const out = herdrCli([
+    "tab",
+    "create",
+    "--label",
+    SUBAGENT_TAB_LABEL,
+    "--no-focus",
+    ...(workspace ? ["--workspace", workspace] : []),
+  ]);
+  const created = JSON.parse(out)?.result;
+  const paneId = created?.root_pane?.pane_id;
+  if (typeof paneId !== "string" || paneId === "") {
+    throw new Error(`Unexpected herdr tab create output: ${out}`);
+  }
+  // A new tab arrives with a live shell in its root pane, so the first subagent
+  // uses that pane instead of splitting it and stranding an idle shell.
+  subagentTabId = created.tab.tab_id;
+  return paneId;
+}
 
 export interface PaneRect {
   pane_id: string;
@@ -279,40 +373,65 @@ export function chooseSplit(candidates: PaneRect[]): {
   return { pane: target.pane_id, direction };
 }
 
-function pickSplitTarget(anchor: string): { pane: string; direction: "right" | "down" } {
-  const candidates = paneRects(anchor).filter((p) => isOwned(p.pane_id));
+function pickSplitTarget(
+  anchor: string,
+  placement: SurfacePlacement,
+): { pane: string; direction: "right" | "down" } {
+  const candidates = paneRects(anchor).filter((p) => isOwned(p.pane_id, placement));
   return chooseSplit(candidates) ?? { pane: anchor, direction: "right" };
 }
 
-/** Panes we may resize: our own, plus the parent pi pane we tile alongside. */
-function isOwned(paneId: string): boolean {
-  return paneId === process.env.HERDR_PANE_ID || ownedSurfaces.has(paneId);
+/**
+ * Panes we may resize for `placement`. In `split` mode the parent pi pane is
+ * one of the tiles; in `tab` mode it lives in another tab entirely.
+ */
+function isOwned(paneId: string, placement: SurfacePlacement): boolean {
+  if (placement === "split" && paneId === process.env.HERDR_PANE_ID) return true;
+  return ownedSurfaces.get(paneId) === placement;
 }
 
 /**
- * Create a new pane for a subagent, splitting the largest pane we own so the
- * parent pi pane keeps its share of the screen. Never steals focus, so panes
- * follow the agent rather than the user.
+ * Create a new pane for a subagent. Never steals focus, so panes follow the
+ * agent rather than the user.
  * See https://github.com/HazAT/pi-interactive-subagents/issues/12
+ *
+ * `split` (the default) carves up the tab pi is running in, splitting the
+ * largest pane we own there so the parent pi pane keeps its share. `tab` puts
+ * the pane in a dedicated subagent tab instead, leaving pi's window untouched;
+ * the first such subagent takes the new tab's root pane and the rest tile
+ * inside it. Both are balanced against their own tab, so the two can be mixed.
  *
  * Returns the new pane id (e.g. `w3:p2`).
  */
-export function createSurface(name: string): string {
+export function createSurface(name: string, placement: SurfacePlacement = "split"): string {
   requireHerdr();
-  const parent = process.env.HERDR_PANE_ID;
+
+  let anchor: string | undefined;
+  if (placement === "tab") {
+    const existing = tabAnchor();
+    if (!existing) {
+      const root = createSubagentTab();
+      ownedSurfaces.set(root, placement);
+      renameSurface(root, name);
+      return root;
+    }
+    anchor = existing;
+  } else {
+    anchor = process.env.HERDR_PANE_ID;
+  }
 
   let target: { pane: string; direction: "right" | "down" };
   try {
-    target = pickSplitTarget(parent ?? "");
+    target = pickSplitTarget(anchor ?? "", placement);
   } catch {
-    // Layout unavailable — split the parent rather than fail the spawn.
-    target = { pane: parent ?? "", direction: "right" };
+    // Layout unavailable — split the anchor rather than fail the spawn.
+    target = { pane: anchor ?? "", direction: "right" };
   }
 
-  const surface = createSurfaceSplit(name, target.direction, target.pane || parent);
-  ownedSurfaces.add(surface);
+  const surface = createSurfaceSplit(name, target.direction, target.pane || anchor);
+  ownedSurfaces.set(surface, placement);
   renameSurface(surface, name);
-  rebalanceSurfaces();
+  rebalanceSurfaces(placement);
   return surface;
 }
 
@@ -449,9 +568,10 @@ function readArgs(surface: string, lines: number, source: string): string[] {
  */
 export function closeSurface(surface: string): void {
   requireHerdr();
+  const placement = ownedSurfaces.get(surface) ?? "split";
   ownedSurfaces.delete(surface);
   herdrCli(["pane", "close", surface]);
-  rebalanceSurfaces();
+  rebalanceSurfaces(placement);
 }
 
 // ── Exit polling ──

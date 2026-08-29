@@ -32,6 +32,8 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  __forgetSubagentTab__ as forgetSubagentTab,
+  type SurfacePlacement,
 } from "../../pi-extension/subagents/herdr.ts";
 
 // Re-export herdr primitives for tests
@@ -44,6 +46,7 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  forgetSubagentTab,
 };
 
 // ── Paths ──
@@ -90,6 +93,22 @@ export function getAvailableBackends(): string[] {
  * --direction`), so there is no focusSurface(id) counterpart — tests assert
  * that focus does not move rather than driving it.
  */
+/** Tab ids currently open, in herdr's order. */
+export function listTabs(): string[] {
+  const out = execFileSync("herdr", ["tab", "list"], { encoding: "utf8" });
+  return (JSON.parse(out)?.result?.tabs ?? []).map((t: any) => t.tab_id);
+}
+
+/** The tab holding a pane, or null when the pane is gone. */
+export function tabOf(surface: string): string | null {
+  try {
+    const out = execFileSync("herdr", ["pane", "get", surface], { encoding: "utf8" });
+    return JSON.parse(out)?.result?.pane?.tab_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function getFocusedSurface(): string | null {
   try {
     const out = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
@@ -154,8 +173,12 @@ export function cleanupTestEnv(env: TestEnv): void {
 /**
  * Create a surface and register it for automatic cleanup.
  */
-export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+export function createTrackedSurface(
+  env: TestEnv,
+  name: string,
+  placement?: SurfacePlacement,
+): string {
+  const surface = createSurface(name, placement);
   env.surfaces.push(surface);
   return surface;
 }

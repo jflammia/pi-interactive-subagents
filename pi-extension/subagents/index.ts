@@ -24,6 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  type SurfacePlacement,
 } from "./herdr.ts";
 
 import {
@@ -132,6 +133,8 @@ interface AgentDefaults {
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
+  /** Where this agent's pane goes: inline in pi's tab, or a dedicated tab. */
+  panePlacement?: SurfacePlacement;
   cwd?: string;
   cli?: string;
   body?: string;
@@ -264,6 +267,10 @@ function parseCommaList(value: string | undefined): string[] | undefined {
   return list.length > 0 ? list : undefined;
 }
 
+function parsePanePlacement(value: string | undefined): SurfacePlacement | undefined {
+  return value === "split" || value === "tab" ? value : undefined;
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -296,6 +303,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
+    panePlacement: parsePanePlacement(getFrontmatterValue(frontmatter, "pane-placement")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
@@ -1204,7 +1212,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface = options?.surface ?? createSurface(params.name, agentDefs?.panePlacement);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -2149,7 +2157,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
+        // Resume where the agent's definition says it belongs, same as a fresh
+        // spawn; the loadout snapshot records which agent this session was.
+        const resumedPlacement = loadout.agent
+          ? loadAgentDefaults(loadout.agent)?.panePlacement
+          : undefined;
+        const surface = createSurface(name, resumedPlacement);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
