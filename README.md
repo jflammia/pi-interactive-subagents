@@ -32,6 +32,36 @@ agent is, which buys things tmux has no equivalent for:
 Everything above `herdr.ts` — the async spawn/steer model, the sandboxed tool
 allowlist, session modes, the status widget — is upstream's work, unchanged.
 
+## What differs from upstream
+
+Coming from [upstream](https://github.com/amosblomqvist/pi-interactive-subagents),
+this is what changed. The sub-agent model — async spawn, steer-back, session
+modes, the whitelist-only tool sandbox — is unchanged.
+
+| | upstream (tmux) | this fork (herdr) |
+| --- | --- | --- |
+| Requirement | tmux, pi started inside it | herdr, pi started inside it (`HERDR_ENV=1`) |
+| Pane layout | `select-layout even-horizontal` after each spawn/exit | largest-pane split on the long axis, then exact split ratios — a grid, not a row |
+| Layout knob | `SUBAGENT_TMUX_LAYOUT` constant (any named tmux layout) | none; `MIN_COLS` / `MIN_ROWS` floors decide when a column becomes a row |
+| Pane naming | tmux cannot name panes | pane carries the sub-agent's name |
+| Where panes go | always a split of pi's pane | `pane-placement: tab` can send an agent to a dedicated tab instead |
+| Agent state | not reported | `working` / `idle` / `unknown` reported to herdr, so its sidebar, notifications, `agent list` and `agent wait` agree with the widget |
+| Sub-agent names | free-form | canonicalized to `[a-z][a-z0-9_-]{0,31}`; `subagent_message` still accepts the free-form name |
+| Split directions | `left`/`right`/`up`/`down` | herdr splits `right`/`down` only; `left`/`up` collapse onto their axis (used by tests only) |
+
+Two behaviour changes to know about when migrating:
+
+- **A name you pass to `subagent()` comes back normalized** — `"Scout Agent 1"`
+  becomes `scout-agent-1`. That name is what the widget, the pane label and
+  `subagent_message` use; the free-form form still resolves.
+- **The layout constant is gone.** Panes tile into a grid on their own and
+  re-tile when one exits, so there is nothing to configure — see
+  [How it works](#how-it-works) for the floors that decide rows vs columns.
+
+One fix here is not herdr-specific and applies upstream too: a finished
+sub-agent's result was lost if its pane had already been closed, because the
+success path closed the surface unguarded and threw.
+
 ## How it works
 
 `subagent()` returns immediately. The sub-agent runs in its own herdr pane, created with `--no-focus` so it never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.

@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in herdr",
   "keywords": [
     "pi-package"
   ],
@@ -9,7 +9,7 @@
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
+    "url": "https://github.com/jflammia/pi-interactive-subagents"
   },
   "type": "module",
   "scripts": {
