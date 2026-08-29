@@ -1268,7 +1268,8 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name, agentDefs?.panePlacement);
+  const surface =
+    options?.surface ?? createSurface(params.name, agentDefs?.panePlacement, effectiveCwd);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1334,8 +1335,8 @@ async function launchSubagent(
     // the caller's task is the follow-up instruction.
     cmdParts.push(shellEscape(params.task));
 
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    // No `cd` prefix: createSurface() opened the pane in effectiveCwd.
+    const command = `${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
@@ -1464,9 +1465,10 @@ async function launchSubagent(
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  // No `cd` prefix: createSurface() opened the pane in effectiveCwd. The env
+  // still rides on the command — PI_SUBAGENT_SURFACE is the pane id, which does
+  // not exist until the split has already happened.
+  const piCommand = envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
@@ -2218,7 +2220,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumedPlacement = loadout.agent
           ? loadAgentDefaults(loadout.agent)?.panePlacement
           : undefined;
-        const surface = createSurface(name, resumedPlacement);
+        const surface = createSurface(name, resumedPlacement, loadout.cwd ?? undefined);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
@@ -2277,11 +2279,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        // Resume in the subagent's original cwd so its tools (safe_bash, edits)
-        // operate where they did before.
-        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
-
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        // The pane was opened in the sub-agent's original cwd, so its tools
+        // (safe_bash, edits) operate where they did before.
+        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

@@ -25,6 +25,10 @@ Everything below is how sub-agents behave in this extension.
   `idle` and `unknown` as they run, so herdr's sidebar, notifications,
   `agent list` and `agent wait` agree with the status widget — background work
   is visible without switching to the pane.
+- **Each pane opens in the sub-agent's working directory.** herdr is told the
+  cwd when the pane is created, so the shell is already there — nothing is
+  prefixed onto the launch command, and the pane is usable as-is if you take it
+  over.
 - **Names are predictable.** A sub-agent's name is normalized once to
   `[a-z][a-z0-9_-]{0,31}` and that one string is the widget row, the pane
   label, the herdr agent label and the generated filenames.

@@ -360,21 +360,38 @@ function findExistingSubagentTab(): string | null {
   }
 }
 
+/**
+ * Forget panes that are no longer live. Closing a subagent pane by hand (or
+ * herdr reaping it with its tab) never routes through closeSurface, so without
+ * this the map only ever grows.
+ */
+export function pruneOwned<T>(owned: Map<string, T>, live: Set<string>): void {
+  for (const paneId of owned.keys()) {
+    if (!live.has(paneId)) owned.delete(paneId);
+  }
+}
+
 /** A live pane in the subagent tab, or null when that tab is gone. */
 function tabAnchor(): string | null {
   if (!subagentTabId) subagentTabId = findExistingSubagentTab();
   if (!subagentTabId) return null;
+  const panes = livePanes();
+  return panes.find((p: any) => p.tab_id === subagentTabId)?.pane_id ?? null;
+}
+
+/** Every pane herdr currently has open, and a chance to forget dead ones. */
+function livePanes(): any[] {
   try {
-    const out = herdrCli(["pane", "list"]);
-    const panes = JSON.parse(out)?.result?.panes ?? [];
-    return panes.find((p: any) => p.tab_id === subagentTabId)?.pane_id ?? null;
+    const panes = JSON.parse(herdrCli(["pane", "list"]))?.result?.panes ?? [];
+    pruneOwned(ownedSurfaces, new Set(panes.map((p: any) => p.pane_id)));
+    return panes;
   } catch {
-    return null;
+    return [];
   }
 }
 
 /** Create the dedicated subagent tab. Returns its ready-to-use root pane. */
-function createSubagentTab(): string {
+function createSubagentTab(cwd?: string): string {
   // Pin the workspace to pi's own. Without `--workspace`, `tab.create` falls
   // back to the *focused* workspace (`src/app/api/tabs.rs`), so a subagent
   // spawned while the user is looking elsewhere would open its tab over there.
@@ -386,6 +403,7 @@ function createSubagentTab(): string {
     SUBAGENT_TAB_LABEL,
     "--no-focus",
     ...(workspace ? ["--workspace", workspace] : []),
+    ...(cwd ? ["--cwd", cwd] : []),
   ]);
   const created = JSON.parse(out)?.result;
   const paneId = created?.root_pane?.pane_id;
@@ -483,14 +501,18 @@ function isOwned(paneId: string, placement: SurfacePlacement): boolean {
  *
  * Returns the new pane id (e.g. `w3:p2`).
  */
-export function createSurface(name: string, placement: SurfacePlacement = "split"): string {
+export function createSurface(
+  name: string,
+  placement: SurfacePlacement = "split",
+  cwd?: string,
+): string {
   requireHerdr();
 
   let anchor: string | undefined;
   if (placement === "tab") {
     const existing = tabAnchor();
     if (!existing) {
-      const root = createSubagentTab();
+      const root = createSubagentTab(cwd);
       ownedSurfaces.set(root, placement);
       renameSurface(root, name);
       return root;
@@ -508,7 +530,7 @@ export function createSurface(name: string, placement: SurfacePlacement = "split
     target = { pane: anchor ?? "", direction: "right" };
   }
 
-  const surface = createSurfaceSplit(name, target.direction, target.pane || anchor);
+  const surface = createSurfaceSplit(name, target.direction, target.pane || anchor, cwd);
   ownedSurfaces.set(surface, placement);
   renameSurface(surface, name);
   rebalanceSurfaces(placement);
@@ -533,6 +555,7 @@ export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
+  cwd?: string,
 ): string {
   void name; // named after the split, via `pane rename`.
   requireHerdr();
@@ -544,6 +567,9 @@ export function createSurfaceSplit(
   } else {
     args.push("--current");
   }
+  // Start the shell where the sub-agent will work, so the pane is usable as-is
+  // and the launch command needs no `cd` prefix.
+  if (cwd) args.push("--cwd", cwd);
 
   const out = herdrCli(args);
   const paneId = JSON.parse(out)?.result?.pane?.pane_id;
@@ -663,6 +689,59 @@ export function closeSurface(surface: string): void {
 
 // ── Exit polling ──
 
+/** The terminal sentinel the launch command prints when the sub-agent exits. */
+const SENTINEL_PATTERN = "__SUBAGENT_DONE_(\\d+)__";
+
+/**
+ * Watch a pane for the exit sentinel using herdr's own `pane wait-output`,
+ * which matches server-side and returns as soon as the line appears.
+ *
+ * This replaces reading the screen on every poll tick: one long-lived process
+ * per sub-agent instead of a `herdr pane read` spawn per second each (measured
+ * at ~6ms per read, so ~31ms/s of CPU with five sub-agents running).
+ *
+ * Calls `onExit` with the shell's exit code. Re-arms if the wait ends without a
+ * match — a pane that has gone away errors immediately, and re-arming lets the
+ * watch recover instead of going deaf, while the caller's file checks continue
+ * either way.
+ */
+function watchForSentinel(
+  surface: string,
+  signal: AbortSignal,
+  onExit: (exitCode: number) => void,
+): void {
+  if (signal.aborted) return;
+
+  const child = execFile(
+    "herdr",
+    [
+      "pane", "wait-output", surface,
+      "--regex", SENTINEL_PATTERN,
+      "--source", "recent-unwrapped",
+      "--lines", "20",
+    ],
+    { encoding: "utf8" },
+    (error, stdout) => {
+      signal.removeEventListener("abort", kill);
+      if (signal.aborted) return;
+      const match = !error && stdout.match(/__SUBAGENT_DONE_(\d+)__/);
+      if (match) {
+        onExit(parseInt(match[1], 10));
+        return;
+      }
+      // No match: the pane may be gone or herdr may have restarted. Wait a beat
+      // so a permanently dead pane cannot spin, then look again.
+      const retry = setTimeout(() => watchForSentinel(surface, signal, onExit), 1000);
+      signal.addEventListener("abort", () => clearTimeout(retry), { once: true });
+    },
+  );
+
+  function kill() {
+    child.kill();
+  }
+  signal.addEventListener("abort", kill, { once: true });
+}
+
 export interface PollResult {
   /** How the subagent exited */
   reason: "done" | "sentinel" | "error";
@@ -711,6 +790,15 @@ export async function pollForExit(
 ): Promise<PollResult> {
   const start = Date.now();
 
+  // herdr watches the pane for the sentinel; we only poll the sidecar files.
+  const watch = new AbortController();
+  const stopWatch = AbortSignal.any([signal, watch.signal]);
+  let sentinelExitCode: number | null = null;
+  watchForSentinel(surface, stopWatch, (code) => {
+    sentinelExitCode = code;
+  });
+
+  try {
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
@@ -737,25 +825,9 @@ export async function pollForExit(
       } catch {}
     }
 
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
+    // Terminal sentinel, seen by the herdr watch above (crash detection).
+    if (sentinelExitCode !== null) {
+      return { reason: "sentinel", exitCode: sentinelExitCode };
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
@@ -773,5 +845,8 @@ export async function pollForExit(
       }
       signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+  } finally {
+    watch.abort();
   }
 }

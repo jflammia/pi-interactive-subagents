@@ -29,6 +29,8 @@ import {
   readScreen,
   readScreenAsync,
   closeSurface,
+  createSurface,
+  pollForExit,
   sleep,
   uniqueId,
   trackTempFile,
@@ -233,6 +235,40 @@ for (const backend of backends) {
       untrackSurface(env, second);
       await sleep(1000);
       assert.deepEqual(subagentTabs(), []);
+    });
+
+    it("detects the exit sentinel and its code", async () => {
+      // pollForExit relies on herdr matching the sentinel server-side; nothing
+      // reads the screen on a timer any more.
+      const surface = createTrackedSurface(env, "exit-probe");
+      await sleep(1200);
+
+      sendLongCommand(surface, `(exit 7)\nprintf '__SUBAGENT_DONE_%s__\\n' "$?"`);
+      const result = await pollForExit(surface, new AbortController().signal, { interval: 500 });
+
+      assert.equal(result.reason, "sentinel");
+      assert.equal(result.exitCode, 7);
+    });
+
+    it("aborting a wait rejects and stops watching", async () => {
+      const surface = createTrackedSurface(env, "abort-probe");
+      await sleep(1000);
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 800);
+      await assert.rejects(() => pollForExit(surface, ctrl.signal, { interval: 300 }));
+    });
+
+    it("opens the pane in the requested cwd", async () => {
+      const surface = createSurface("cwd-probe", "split", "/usr/local");
+      env.surfaces.push(surface);
+      await sleep(1200);
+      const pane = JSON.parse(
+        execFileSync("herdr", ["pane", "get", surface], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      ).result.pane;
+      assert.equal(pane.cwd, "/usr/local");
     });
 
     it("closing a surface that is already gone is not an error", async () => {

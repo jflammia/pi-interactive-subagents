@@ -35,6 +35,7 @@ import {
   chooseSplit,
   evenSplitRatios,
   canonicalSubagentName,
+  pruneOwned,
   type LayoutNode,
 } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -2889,5 +2890,26 @@ describe("herdr.ts canonicalSubagentName", () => {
     for (const raw of ["../../etc/passwd", "name with spaces", "Weird/Name*?"]) {
       assert.match(canonicalSubagentName(raw), /^[a-z][a-z0-9_-]{0,31}$/);
     }
+  });
+});
+
+describe("herdr.ts pruneOwned", () => {
+  it("forgets panes herdr no longer has", () => {
+    // A pane closed by hand never routes through closeSurface.
+    const owned = new Map([["w1:p1", "split"], ["w1:p2", "tab"]]);
+    pruneOwned(owned, new Set(["w1:p1"]));
+    assert.deepEqual([...owned.keys()], ["w1:p1"]);
+  });
+
+  it("keeps everything when all panes are live", () => {
+    const owned = new Map([["w1:p1", "split"], ["w1:p2", "split"]]);
+    pruneOwned(owned, new Set(["w1:p1", "w1:p2", "w1:p3"]));
+    assert.equal(owned.size, 2);
+  });
+
+  it("empties the map when herdr reports no panes", () => {
+    const owned = new Map([["w1:p1", "split"]]);
+    pruneOwned(owned, new Set());
+    assert.equal(owned.size, 0);
   });
 });
