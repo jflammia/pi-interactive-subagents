@@ -36,6 +36,7 @@ import {
   evenSplitRatios,
   canonicalSubagentName,
   pruneOwned,
+  socketEndpoint,
   type LayoutNode,
 } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -2911,5 +2912,38 @@ describe("herdr.ts pruneOwned", () => {
     const owned = new Map([["w1:p1", "split"]]);
     pruneOwned(owned, new Set());
     assert.equal(owned.size, 0);
+  });
+});
+
+describe("herdr.ts socketEndpoint", () => {
+  // The runtime path is exercised on macOS only; these pin the string herdr's
+  // Windows named pipe needs, which is the part that can silently rot.
+  const winSocket = "C:\\Users\\justin\\AppData\\Roaming\\herdr\\herdr.sock";
+
+  it("passes a unix socket path through untouched", () => {
+    const path = "/Users/justin/.config/herdr/herdr.sock";
+    assert.equal(socketEndpoint(path, "darwin"), path);
+    assert.equal(socketEndpoint(path, "linux"), path);
+  });
+
+  it("maps to a named pipe on win32", () => {
+    assert.equal(
+      socketEndpoint(winSocket, "win32"),
+      "\\\\.\\pipe\\C:\\Users\\justin\\AppData\\Roaming\\herdr\\herdr.sock",
+    );
+  });
+
+  it("uses exactly the \\\\.\\pipe\\ prefix", () => {
+    // A stray escape here yields a pipe name Windows cannot open, and nothing
+    // on this platform would notice.
+    const endpoint = socketEndpoint(winSocket, "win32");
+    assert.ok(endpoint.startsWith("\\\\.\\pipe\\"), endpoint);
+    assert.equal(endpoint.slice("\\\\.\\pipe\\".length), winSocket);
+    assert.ok(!endpoint.includes("pipe\\\\"), "the name must not be double-escaped");
+  });
+
+  it("defaults to the running platform", () => {
+    const path = "/tmp/herdr.sock";
+    assert.equal(socketEndpoint(path), process.platform === "win32" ? socketEndpoint(path, "win32") : path);
   });
 });

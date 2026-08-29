@@ -92,16 +92,24 @@ export function shellEscape(s: string): string {
  *
  * The server handles exactly one request per connection and then closes.
  */
+/**
+ * What `net.connect` needs for herdr's local socket on this platform.
+ *
+ * Unix: the socket path as-is. Windows: the local socket is a named pipe, and
+ * herdr passes the whole socket-path string to interprocess's namespaced-name
+ * mapping (`to_ns_name::<GenericNamespaced>` in `src/ipc.rs`), which is the
+ * `\\.\pipe\<name>` form. herdr's own Node integration maps
+ * HERDR_SOCKET_PATH exactly this way.
+ */
+export function socketEndpoint(socketPath: string, platform: string = process.platform): string {
+  return platform === "win32" ? `\\\\.\\pipe\\${socketPath}` : socketPath;
+}
+
 function herdrApi(method: string, params: unknown): Promise<any> {
   return new Promise((resolve, reject) => {
     const socketPath = process.env.HERDR_SOCKET_PATH;
     if (!socketPath) return reject(new Error("HERDR_SOCKET_PATH is not set"));
-    // On Windows the local socket is a named pipe, as herdr's own integration
-    // does it. Untested here (macOS), but a plain path cannot work there.
-    const endpoint =
-      process.platform === "win32" ? `\\\\.\\pipe\\${socketPath}` : socketPath;
-
-    const sock = connect(endpoint);
+    const sock = connect(socketEndpoint(socketPath));
     let buf = "";
     sock.setTimeout(5000, () => sock.destroy(new Error("herdr socket timed out")));
     sock.on("error", reject);
