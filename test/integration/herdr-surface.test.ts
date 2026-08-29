@@ -18,6 +18,8 @@ import {
   cleanupTestEnv,
   createTrackedSurface,
   getFocusedSurface,
+  reportAgentState,
+  releaseAgentState,
   forgetSubagentTab,
   listTabs,
   tabOf,
@@ -173,6 +175,32 @@ for (const backend of backends) {
 
       assert.ok(screen1.includes(`S1_${m1}`), `Surface 1 missing marker. Got:\n${screen1}`);
       assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
+    });
+
+    it("reports agent lifecycle state to herdr without a session reference", async () => {
+      const surface = createTrackedSurface(env, "state-probe");
+      await sleep(1000);
+      const paneAgent = () =>
+        JSON.parse(
+          execFileSync("herdr", ["pane", "get", surface], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }),
+        ).result.pane;
+
+      reportAgentState(surface, "state-probe", "working", "scanning");
+      await sleep(400);
+      assert.equal(paneAgent().agent_status, "working");
+
+      reportAgentState(surface, "state-probe", "idle");
+      await sleep(400);
+      assert.equal(paneAgent().agent_status, "idle");
+
+      // The point of reporting from the parent: herdr never learns a session
+      // it could relaunch unsandboxed after a restart.
+      assert.equal(paneAgent().agent_session, undefined);
+
+      releaseAgentState(surface, "state-probe");
     });
 
     it("adopts a leftover subagents tab instead of stacking duplicates", async () => {

@@ -32,6 +32,8 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  reportAgentState,
+  releaseAgentState,
   __forgetSubagentTab__ as forgetSubagentTab,
   type SurfacePlacement,
 } from "../../pi-extension/subagents/herdr.ts";
@@ -46,6 +48,8 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  reportAgentState,
+  releaseAgentState,
   forgetSubagentTab,
 };
 

@@ -34,6 +34,7 @@ import {
   shellEscape,
   chooseSplit,
   evenSplitRatios,
+  agentLabel,
   type LayoutNode,
 } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -2805,5 +2806,30 @@ describe("herdr.ts evenSplitRatios", () => {
     assert.deepEqual(evenSplitRatios(tree, (id) => id.startsWith("ours")), [
       { path: [true], ratio: 0.5 },
     ]);
+  });
+});
+
+describe("herdr.ts agentLabel", () => {
+  // herdr agent labels must match [a-z][a-z0-9_-]{0,31}; subagent names are
+  // free-form, so a name herdr would reject must never break a state report.
+  it("passes a already-valid name through", () => {
+    assert.equal(agentLabel("scout-1"), "scout-1");
+  });
+
+  it("lowercases and replaces spaces and punctuation", () => {
+    assert.equal(agentLabel("Scout Agent #1"), "scout-agent--1");
+  });
+
+  it("drops leading characters that cannot start a label", () => {
+    assert.equal(agentLabel("2nd-reviewer"), "nd-reviewer");
+  });
+
+  it("falls back rather than emitting an empty label", () => {
+    assert.equal(agentLabel("***"), "subagent");
+    assert.equal(agentLabel(""), "subagent");
+  });
+
+  it("truncates to herdr's 32-character limit", () => {
+    assert.equal(agentLabel("a".repeat(50)).length, 32);
   });
 });

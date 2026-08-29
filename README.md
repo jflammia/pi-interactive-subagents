@@ -212,6 +212,26 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
+## herdr agent state
+
+Sub-agent panes report their lifecycle to herdr — `working`, `idle`, `unknown` —
+so herdr's sidebar, notifications, `agent list` and `agent wait` agree with the
+status widget. The parent reports on each sub-agent's behalf, on state
+transitions only.
+
+It deliberately does **not** load herdr's own pi integration
+(`~/.pi/agent/extensions/herdr-agent-state.ts`) into sub-agents. Sub-agents run
+`--no-extensions` by design, and that integration also reports a *session
+reference*, which herdr uses to relaunch a pane as plain `pi --session <path>`
+after a server restart (`src/agent_resume.rs`) — unsandboxed, with every global
+extension and the full toolset. That is the same escalation `subagent_message`
+refuses, and `session.resume_agents_on_restore` is global-only, so opting out
+would disable restore for your own panes too. Reporting state without a session
+reference gives herdr the state it needs and nothing to resume.
+
+`cli: claude` sub-agents are left alone here: herdr's Claude Code integration is
+a global hook, so those panes already report for themselves.
+
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)

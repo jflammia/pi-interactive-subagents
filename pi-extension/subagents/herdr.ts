@@ -214,6 +214,68 @@ function rebalanceSurfaces(placement: SurfacePlacement): void {
   );
 }
 
+// ── Agent lifecycle reporting ──
+
+/**
+ * How we identify ourselves to herdr when reporting a subagent's state.
+ * Stable and unique to this extension, per herdr's custom-integration contract.
+ */
+const AGENT_SOURCE = "custom:pi-subagents";
+
+export type AgentReportState = "working" | "idle" | "blocked" | "unknown";
+
+/** herdr ignores stale reports from the same source by sequence number. */
+let reportSeq = 0;
+
+/** herdr agent labels: `[a-z][a-z0-9_-]{0,31}`. */
+export function agentLabel(name: string): string {
+  const cleaned = name.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^[^a-z]+/, "");
+  return (cleaned || "subagent").slice(0, 32);
+}
+
+/**
+ * Tell herdr what a subagent pane is doing, so its sidebar, notifications,
+ * `agent list` and `agent wait` see the same state the status widget does.
+ *
+ * The parent reports on the subagent's behalf rather than the child loading
+ * herdr's own pi integration: subagents launch `--no-extensions` by design, and
+ * that integration also reports a *session reference*, which herdr uses to
+ * relaunch a pane as plain `pi --session <path>` after a server restart
+ * (`src/agent_resume.rs`) — unsandboxed, with every global extension and the
+ * full toolset. That is exactly the escalation `subagent_message` refuses. We
+ * report state and nothing else, so there is nothing for herdr to resume.
+ *
+ * Best-effort: a failed report must never disturb a running subagent.
+ */
+export function reportAgentState(
+  surface: string,
+  name: string,
+  state: AgentReportState,
+  message?: string,
+): void {
+  try {
+    herdrCli([
+      "pane", "report-agent", surface,
+      "--source", AGENT_SOURCE,
+      "--agent", agentLabel(name),
+      "--state", state,
+      "--seq", String(++reportSeq),
+      ...(message ? ["--message", message.slice(0, 120)] : []),
+    ]);
+  } catch {}
+}
+
+/** Hand lifecycle authority for this pane back to herdr. */
+export function releaseAgentState(surface: string, name: string): void {
+  try {
+    herdrCli([
+      "pane", "release-agent", surface,
+      "--source", AGENT_SOURCE,
+      "--agent", agentLabel(name),
+    ]);
+  } catch {}
+}
+
 /**
  * Drop the cached subagent-tab id, so the next `tab` placement rediscovers it
  * the way a freshly started pi process would. Tests only.

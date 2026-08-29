@@ -24,7 +24,10 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  reportAgentState,
+  releaseAgentState,
   type SurfacePlacement,
+  type AgentReportState,
 } from "./herdr.ts";
 
 import {
@@ -48,6 +51,7 @@ import {
   advanceStatusState,
   capStatusLines,
   classifyStatus,
+  type SubagentStatusKind,
   createStatusState,
   forceStatusAfterInterrupt,
   formatStatusAggregate,
@@ -634,6 +638,8 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Last lifecycle state reported to herdr, so we only report transitions. */
+  herdrState?: AgentReportState;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -911,6 +917,42 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
   return activity.activeScope;
 }
 
+/**
+ * The status widget's vocabulary in herdr's terms. `running` is the Claude
+ * fallback: those panes already report through herdr's own Claude Code
+ * integration, so we stay out of their way.
+ */
+const HERDR_STATE_BY_KIND: Record<SubagentStatusKind, AgentReportState | null> = {
+  starting: "working",
+  active: "working",
+  waiting: "idle",
+  stalled: "unknown",
+  running: null,
+};
+
+/**
+ * Mirror a subagent's state onto its herdr pane, so herdr's sidebar,
+ * notifications, `agent list` and `agent wait` agree with the status widget.
+ * Reports transitions only — a spawn per tick would be wasteful and pointless.
+ */
+function syncHerdrAgentState(running: RunningSubagent, observedAt: number): void {
+  const snapshot = classifyStatus(running.statusState, observedAt);
+  const state = HERDR_STATE_BY_KIND[snapshot.kind];
+  if (!state || state === running.herdrState) return;
+  running.herdrState = state;
+  reportAgentState(running.surface, running.name, state, snapshot.activityLabel ?? undefined);
+}
+
+/** Settle the pane at idle and hand lifecycle authority back to herdr. */
+function finishHerdrAgentState(running: RunningSubagent): void {
+  if (running.cli === "claude") return;
+  if (running.herdrState && running.herdrState !== "idle") {
+    reportAgentState(running.surface, running.name, "idle");
+  }
+  running.herdrState = undefined;
+  releaseAgentState(running.surface, running.name);
+}
+
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
   if (running.cli === "claude") return;
 
@@ -937,6 +979,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
       latestEvent: read.activity.latestEvent,
       activityLabel: activityLabel(read.activity),
     }, observedAt);
+    syncHerdrAgentState(running, observedAt);
     return;
   }
 
@@ -944,6 +987,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     snapshot: read.reason,
     snapshotError: read.error,
   }, observedAt);
+  syncHerdrAgentState(running, observedAt);
 }
 
 /**
@@ -1578,6 +1622,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
+      finishHerdrAgentState(running);
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
@@ -1606,6 +1651,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
+    finishHerdrAgentState(running);
     closeSurface(surface);
     runningSubagents.delete(running.id);
 
@@ -1622,6 +1668,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
+      finishHerdrAgentState(running);
       closeSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
