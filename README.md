@@ -1,12 +1,40 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [herdr](https://herdr.dev) panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**herdr-only fork** of [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents),
+which runs sub-agents in tmux panes. See [Why this fork](#why-this-fork).
+
+## Why this fork
+
+Upstream is tmux-only: it replaced the original project's multi-multiplexer
+surface layer (cmux, tmux, zellij, WezTerm) with a single 354-line `tmux.ts`.
+This fork swaps that one backend for [herdr](https://herdr.dev), a terminal
+workspace manager built specifically for running coding agents, and keeps the
+substitution at the same seam — `index.ts` makes no multiplexer calls of its
+own, importing nine functions from `herdr.ts` where it used to import them from
+`tmux.ts`.
+
+herdr is not just a different multiplexer to target. Its model knows what an
+agent is, which buys things tmux has no equivalent for:
+
+- **Panes carry the sub-agent's name** (`pane rename`), instead of an anonymous
+  `%12` whose contents you have to read to identify.
+- **Sub-agents can live in a dedicated tab** (`pane-placement: tab`), so a long
+  research run does not carve up the window you are working in.
+- **herdr sees each sub-agent's lifecycle** — `working`, `idle`, `unknown` — so
+  its sidebar, notifications, `agent list` and `agent wait` agree with the
+  status widget, and background work is visible without switching to the pane.
+- **Layout is set numerically, not by named preset.** tmux offered
+  `even-horizontal` and friends; herdr exposes the split tree, so panes tile
+  into an exact grid and re-tile when one exits.
+
+Everything above `herdr.ts` — the async spawn/steer model, the sandboxed tool
+allowlist, session modes, the status widget — is upstream's work, unchanged.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own herdr pane, created with `--no-focus` so it never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +45,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+Panes are tiled into a grid and kept evenly sized. herdr splits the *target pane's* real estate rather than the window's, so each new pane splits the largest pane the extension owns, across that pane's long axis — adding a row once another column would fall below `MIN_COLS`. After every spawn and exit a debounced pass sets each split's ratio so the panes come out uniform (6 subagents tile to an exact 3x2). The floors are `MIN_COLS` / `MIN_ROWS` in `pi-extension/subagents/herdr.ts`.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -29,7 +57,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated herdr pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -178,15 +206,37 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [herdr](https://herdr.dev)
 
 ```bash
-tmux new -A -s pi 'pi'
+herdr        # then run `pi` in a pane
 ```
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+Lineage:
+
+1. [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents)
+   originated the sub-agent architecture, the multi-multiplexer surface layer,
+   and the status widget. Its supervision features were inspired by
+   [RepoPrompt](https://repoprompt.com/).
+2. [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents)
+   re-implemented it as a tmux-only extension, and is the direct upstream of
+   this fork — the async spawn/steer model, the whitelist-only tool sandbox,
+   session modes and the status widget are all its work.
+3. This fork replaces the tmux surface layer with [herdr](https://herdr.dev).
+
+Tracking upstream:
+
+```bash
+git fetch upstream
+git rebase -X find-renames=25% upstream/main
+```
+
+The rename threshold is needed because `tmux.ts` was `git mv`d to `herdr.ts` and
+then rewritten past git's default 50% similarity; without it, an upstream edit
+to `tmux.ts` conflicts as *deleted by us* on every rebase instead of merging
+into `herdr.ts`.
 
 ## License
 

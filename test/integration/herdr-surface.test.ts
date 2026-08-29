@@ -1,12 +1,12 @@
 /**
- * Integration tests for the tmux surface layer.
+ * Integration tests for the herdr surface layer.
  *
- * These tests exercise real tmux operations: creating panes,
+ * These tests exercise real herdr operations: creating panes,
  * sending commands, reading screen output, and closing panes.
  * No LLM calls — fast and free.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run inside a herdr pane:
+ *   npm run test:integration
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -16,10 +16,7 @@ import {
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
-  createTrackedSurfaceSplit,
-  focusSurface,
   getFocusedSurface,
-  waitForFocusedSurface,
   untrackSurface,
   sendCommand,
   sendLongCommand,
@@ -38,12 +35,12 @@ const backends = getAvailableBackends();
 const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  herdr is not available — skipping herdr-surface integration tests");
+  console.log("   Run inside a herdr pane to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`tmux-surface [${backend}]`, { timeout: 60_000 }, () => {
+  describe(`herdr-surface [${backend}]`, { timeout: 60_000 }, () => {
     let env: TestEnv;
 
     before(() => {
@@ -55,11 +52,8 @@ for (const backend of backends) {
     });
 
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
-      const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
-
-      focusSurface(anchor);
-      await waitForFocusedSurface(anchor, 10_000);
+      const anchor = getFocusedSurface();
+      assert.ok(anchor, "expected herdr to report a focused pane");
 
       const childA = createTrackedSurface(env, "focus-child-a");
       await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
@@ -131,7 +125,9 @@ for (const backend of backends) {
       sendLongCommand(surface, command);
       await sleep(2000);
 
-      const screen = readScreen(surface, 50);
+      // 200 rows: unwrapping happens after the row limit, so a 500-char line
+      // in a pane narrowed by the earlier tests needs plenty of rows to survive.
+      const screen = readScreen(surface, 200);
       assert.ok(
         screen.includes(`LONG_${marker}`),
         `Expected long command output. Got:\n${screen.slice(0, 300)}...`,
@@ -180,7 +176,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      const filePath = `/tmp/pi-tmux-test-${marker}.txt`;
+      const filePath = `/tmp/pi-herdr-test-${marker}.txt`;
 
       sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
 

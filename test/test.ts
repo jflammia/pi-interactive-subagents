@@ -30,7 +30,12 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  shellEscape,
+  chooseSplit,
+  evenSplitRatios,
+  type LayoutNode,
+} from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +61,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -1741,7 +1746,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
+describe("herdr.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -2652,7 +2657,7 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("herdr.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -2674,5 +2679,98 @@ describe("tmux.ts", () => {
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
     });
+  });
+});
+
+describe("herdr.ts chooseSplit", () => {
+  const pane = (id: string, width: number, height: number) => ({ pane_id: id, width, height });
+
+  it("returns null with no candidates", () => {
+    assert.equal(chooseSplit([]), null);
+  });
+
+  it("splits the largest pane, not the parent", () => {
+    // Parent already gave up half its width to the first subagent.
+    const choice = chooseSplit([pane("parent", 60, 40), pane("child", 120, 40)]);
+    assert.equal(choice?.pane, "child");
+  });
+
+  it("cuts a wide pane into columns", () => {
+    // 200x40: wider than square (a cell is ~2x as tall as wide).
+    assert.equal(chooseSplit([pane("a", 200, 40)])?.direction, "right");
+  });
+
+  it("adds a row once another column would be too narrow", () => {
+    // 70 cols halves to 35 — below MIN_COLS (40) — but 40 rows halve fine.
+    assert.equal(chooseSplit([pane("a", 70, 40)])?.direction, "down");
+  });
+
+  it("cuts a tall pane into rows even when it could go either way", () => {
+    // 100x60 is taller than square, and both axes clear the minimums.
+    assert.equal(chooseSplit([pane("a", 100, 60)])?.direction, "down");
+  });
+
+  it("still picks an axis when the pane is out of room on both", () => {
+    // Nothing fits; a spawn must never fail over cosmetics.
+    const choice = chooseSplit([pane("a", 50, 14)]);
+    assert.equal(choice?.pane, "a");
+    assert.equal(choice?.direction, "right");
+  });
+});
+
+describe("herdr.ts evenSplitRatios", () => {
+  const pane = (id: string): LayoutNode => ({ type: "pane", pane_id: id });
+  const split = (
+    first: LayoutNode,
+    second: LayoutNode,
+    direction: "right" | "down" = "right",
+  ): LayoutNode => ({ type: "split", direction, ratio: 0.5, first, second });
+  const all = () => true;
+
+  it("has nothing to do for a single pane", () => {
+    assert.deepEqual(evenSplitRatios(pane("a"), all), []);
+  });
+
+  it("splits two panes down the middle", () => {
+    assert.deepEqual(evenSplitRatios(split(pane("a"), pane("b")), all), [
+      { path: [], ratio: 0.5 },
+    ]);
+  });
+
+  it("weights a split by how many panes stack along its own axis", () => {
+    // [[a|b] | c] all cut vertically: the left column holds two of three, so 2/3.
+    const tree = split(split(pane("a"), pane("b")), pane("c"));
+    assert.deepEqual(evenSplitRatios(tree, all), [
+      { path: [], ratio: 2 / 3 },
+      { path: [false], ratio: 0.5 },
+    ]);
+  });
+
+  it("ignores panes stacked across the split's axis", () => {
+    // [[a/b] | c]: a and b are stacked vertically, so they span the horizontal
+    // axis as one column — an even split, not 2/3. Counting panes here would
+    // equalize area and leave c half as wide and twice as tall as a and b.
+    const tree = split(split(pane("a"), pane("b"), "down"), pane("c"));
+    assert.deepEqual(evenSplitRatios(tree, all), [
+      { path: [], ratio: 0.5 },
+      { path: [false], ratio: 0.5 },
+    ]);
+  });
+
+  it("addresses nested splits by path", () => {
+    // [a | [b | c]]: descending into `second` is `true`.
+    const tree = split(pane("a"), split(pane("b"), pane("c")));
+    assert.deepEqual(evenSplitRatios(tree, all), [
+      { path: [], ratio: 1 / 3 },
+      { path: [true], ratio: 0.5 },
+    ]);
+  });
+
+  it("leaves a split alone when a pane under it is not ours", () => {
+    // The user's pane shares the root split — resizing it would move their pane.
+    const tree = split(pane("theirs"), split(pane("ours-1"), pane("ours-2")));
+    assert.deepEqual(evenSplitRatios(tree, (id) => id.startsWith("ours")), [
+      { path: [true], ratio: 0.5 },
+    ]);
   });
 });

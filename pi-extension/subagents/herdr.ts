@@ -1,0 +1,570 @@
+/**
+ * herdr surface layer — the only terminal multiplexer this extension supports.
+ *
+ * Everything the extension does to a pane goes through the small API in this
+ * file: create/split a pane, type a command into it, read its screen, close
+ * it, and poll for exit. Keeping the herdr calls isolated here means index.ts
+ * stays testable without a multiplexer running.
+ *
+ * Panes are identified by workspace-qualified herdr pane ids (e.g. `w3:p2`).
+ * Splits always target the parent pi's pane (`$HERDR_PANE_ID`) so they follow
+ * the agent rather than the user's focus.
+ */
+import { execFile, execFileSync } from "node:child_process";
+import { connect } from "node:net";
+import { promisify } from "node:util";
+import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
+const execFileAsync = promisify(execFile);
+
+// ── Availability ──
+
+const commandAvailability = new Map<string, boolean>();
+
+function hasCommand(command: string): boolean {
+  if (commandAvailability.has(command)) {
+    return commandAvailability.get(command)!;
+  }
+
+  let available = false;
+  try {
+    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+    available = true;
+  } catch {
+    available = false;
+  }
+
+  commandAvailability.set(command, available);
+  return available;
+}
+
+/**
+ * True when running inside herdr with the herdr binary on PATH.
+ * `HERDR_ENV=1` is set by herdr in every process it spawns.
+ */
+export function isHerdrAvailable(): boolean {
+  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
+}
+
+export function isMuxAvailable(): boolean {
+  return isHerdrAvailable();
+}
+
+export function muxSetupHint(): string {
+  return "Start pi inside herdr (`herdr`, then run `pi` in a pane).";
+}
+
+function requireHerdr(): void {
+  if (!isHerdrAvailable()) {
+    throw new Error(`herdr is required for subagents. ${muxSetupHint()}`);
+  }
+}
+
+/**
+ * Run a herdr CLI command and return its stdout.
+ *
+ * stderr is captured rather than inherited: herdr prints a JSON error blob
+ * there on any failure, and letting that reach the terminal corrupts pi's TUI.
+ */
+function herdrCli(args: string[]): string {
+  return execFileSync("herdr", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+// ── Shell helpers ──
+
+export function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// ── Socket API ──
+
+/**
+ * One request over herdr's socket API, for the few methods the CLI does not
+ * wrap. Everything else should use the CLI: herdr's server reads a request one
+ * byte at a time and sleeps CONNECTION_POLL_INTERVAL (100ms) whenever that read
+ * comes back pending (`src/api/server.rs`), so a client that cannot deliver its
+ * request in the same instant it connects pays ~160ms. Node's event loop always
+ * needs a turn, so it always loses that race, while the Rust CLI wins it and
+ * costs ~4ms including the process spawn. Fine here: this is only ever called
+ * from the debounced background rebalance.
+ *
+ * The server handles exactly one request per connection and then closes.
+ */
+function herdrApi(method: string, params: unknown): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const socketPath = process.env.HERDR_SOCKET_PATH;
+    if (!socketPath) return reject(new Error("HERDR_SOCKET_PATH is not set"));
+    const sock = connect(socketPath);
+    let buf = "";
+    sock.setTimeout(5000, () => sock.destroy(new Error("herdr socket timed out")));
+    sock.on("error", reject);
+    sock.on("connect", () => sock.write(JSON.stringify({ id: "pi", method, params }) + "\n"));
+    sock.on("data", (chunk) => {
+      buf += chunk;
+      const end = buf.indexOf("\n");
+      if (end < 0) return;
+      sock.destroy();
+      try {
+        const message = JSON.parse(buf.slice(0, end));
+        message.error ? reject(new Error(message.error.message)) : resolve(message.result);
+      } catch (err) {
+        reject(err as Error);
+      }
+    });
+  });
+}
+
+/** A node of the BSP tree returned by `layout.export`. */
+export type LayoutNode =
+  | { type: "pane"; pane_id?: string }
+  | { type: "split"; direction: "right" | "down"; ratio: number; first: LayoutNode; second: LayoutNode };
+
+/**
+ * Ratios that make every pane we own the same size.
+ *
+ * A split's share must weigh each side by how many panes it stacks *along that
+ * split's own axis*, not by how many panes it holds: a subtree split the other
+ * way spans the axis with a single band, however many panes are in it. Counting
+ * panes instead equalizes area, which lets cells drift to the same area in
+ * wildly different shapes (101x14 beside 34x42). Counting extent keeps a
+ * grid-shaped tree's cells uniform, and collapses to 0.5 everywhere once the
+ * grid is balanced.
+ *
+ * Splits with a pane we do not own anywhere beneath them are left alone — the
+ * user's own panes keep the size they chose — but our subtrees underneath such
+ * a split are still evened out.
+ *
+ * `path` addresses a split for `layout.set_split_ratio`: false descends into
+ * `first`, true into `second` (`set_ratio_at` in `src/layout.rs`).
+ */
+export function evenSplitRatios(
+  root: LayoutNode,
+  isOwned: (paneId: string) => boolean,
+): { path: boolean[]; ratio: number }[] {
+  const out: { path: boolean[]; ratio: number }[] = [];
+
+  /** Panes stacked along `axis`, or null if any pane below is not ours. */
+  function extent(node: LayoutNode, axis: "right" | "down"): number | null {
+    if (node.type === "pane") return node.pane_id && isOwned(node.pane_id) ? 1 : null;
+    const first = extent(node.first, axis);
+    const second = extent(node.second, axis);
+    if (first === null || second === null) return null;
+    // Along this split's axis the two sides sit end to end; across it they
+    // overlap, so the wider of the two sets the extent.
+    return node.direction === axis ? first + second : Math.max(first, second);
+  }
+
+  function walk(node: LayoutNode, path: boolean[]): void {
+    if (node.type !== "split") return;
+    const first = extent(node.first, node.direction);
+    const second = extent(node.second, node.direction);
+    if (first !== null && second !== null) {
+      out.push({ path, ratio: first / (first + second) });
+    }
+    walk(node.first, [...path, false]);
+    walk(node.second, [...path, true]);
+  }
+
+  walk(root, []);
+  return out;
+}
+
+let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Re-balance the tab so every pane we own is exactly the same size.
+ *
+ * Splitting the largest pane keeps panes within 2x of each other; this makes
+ * them exactly even at any count (3, 5, 6, 7 — not just powers of two), and it
+ * is the only way to tidy up after a subagent exits, since herdr hands a closed
+ * pane's space to its sibling alone. There is no CLI verb for it —
+ * `layout.set_split_ratio` is socket-only.
+ *
+ * Debounced so a burst of parallel spawns or staggered exits collapses into one
+ * pass, and non-fatal throughout: a cosmetic resize must never break spawning
+ * or watching.
+ */
+function rebalanceSurfaces(): void {
+  if (rebalanceTimer) clearTimeout(rebalanceTimer);
+  rebalanceTimer = setTimeout(() => {
+    rebalanceTimer = null;
+    void (async () => {
+      try {
+        const anchor = process.env.HERDR_PANE_ID;
+        if (!anchor) return;
+        const result = await herdrApi("layout.export", { pane_id: anchor });
+        const root: LayoutNode | undefined = result?.layout?.root;
+        if (!root) return;
+        for (const { path, ratio } of evenSplitRatios(root, isOwned)) {
+          await herdrApi("layout.set_split_ratio", { pane_id: anchor, path, ratio });
+        }
+      } catch {
+        // Panes may have closed mid-pass; balancing is best-effort.
+      }
+    })();
+  }, 120);
+}
+
+// ── Surface primitives ──
+
+/**
+ * Smallest pane we are willing to create, in terminal cells. An agent TUI
+ * below this is unreadable. herdr itself enforces no minimum — `src/layout.rs`
+ * splits a rect by ratio and will happily render a 1-column pane — so the
+ * floor has to live here.
+ */
+const MIN_COLS = 40;
+const MIN_ROWS = 12;
+
+/**
+ * Panes this extension created, so tiling only ever re-splits our own real
+ * estate and never a pane the user opened alongside us.
+ */
+const ownedSurfaces = new Set<string>();
+
+export interface PaneRect {
+  pane_id: string;
+  width: number;
+  height: number;
+}
+
+/** Pane rects for the tab containing `anchor`. */
+function paneRects(anchor: string): PaneRect[] {
+  const out = herdrCli(["pane", "layout", "--pane", anchor]);
+  const panes = JSON.parse(out)?.result?.layout?.panes ?? [];
+  return panes.map((p: any) => ({
+    pane_id: p.pane_id,
+    width: p.rect?.width ?? 0,
+    height: p.rect?.height ?? 0,
+  }));
+}
+
+/**
+ * Pick the pane to split and the axis to split it on.
+ *
+ * herdr splits the *target* pane's real estate rather than the window's, so
+ * repeatedly splitting the parent pi pane halves it every spawn until it is
+ * unusable. Instead: always split the largest pane we own, and split it across
+ * its long axis. Splitting the largest keeps every pane within 2x of every
+ * other (exactly even at 2, 4, 8 subagents), which is what tmux's
+ * `select-layout even-horizontal` bought us — and alternating the axis grows
+ * the layout into a grid, adding rows once columns would go below MIN_COLS,
+ * rather than into ever-thinner columns.
+ *
+ * A terminal cell is roughly twice as tall as it is wide, so a pane looks
+ * square at width ~= 2 * height; that is the threshold for preferring a
+ * vertical cut over a horizontal one.
+ */
+export function chooseSplit(candidates: PaneRect[]): {
+  pane: string;
+  direction: "right" | "down";
+} | null {
+  const target = [...candidates].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+  if (!target) return null;
+
+  const wideEnough = target.width / 2 >= MIN_COLS;
+  const tallEnough = target.height / 2 >= MIN_ROWS;
+  const looksWide = target.width >= target.height * 2;
+
+  let direction: "right" | "down";
+  if (wideEnough && tallEnough) direction = looksWide ? "right" : "down";
+  else if (wideEnough) direction = "right";
+  else if (tallEnough) direction = "down";
+  // Out of room on both axes: cut the long way and accept a cramped pane —
+  // a spawn must never fail over cosmetics.
+  else direction = looksWide ? "right" : "down";
+
+  return { pane: target.pane_id, direction };
+}
+
+function pickSplitTarget(anchor: string): { pane: string; direction: "right" | "down" } {
+  const candidates = paneRects(anchor).filter((p) => isOwned(p.pane_id));
+  return chooseSplit(candidates) ?? { pane: anchor, direction: "right" };
+}
+
+/** Panes we may resize: our own, plus the parent pi pane we tile alongside. */
+function isOwned(paneId: string): boolean {
+  return paneId === process.env.HERDR_PANE_ID || ownedSurfaces.has(paneId);
+}
+
+/**
+ * Create a new pane for a subagent, splitting the largest pane we own so the
+ * parent pi pane keeps its share of the screen. Never steals focus, so panes
+ * follow the agent rather than the user.
+ * See https://github.com/HazAT/pi-interactive-subagents/issues/12
+ *
+ * Returns the new pane id (e.g. `w3:p2`).
+ */
+export function createSurface(name: string): string {
+  requireHerdr();
+  const parent = process.env.HERDR_PANE_ID;
+
+  let target: { pane: string; direction: "right" | "down" };
+  try {
+    target = pickSplitTarget(parent ?? "");
+  } catch {
+    // Layout unavailable — split the parent rather than fail the spawn.
+    target = { pane: parent ?? "", direction: "right" };
+  }
+
+  const surface = createSurfaceSplit(name, target.direction, target.pane || parent);
+  ownedSurfaces.add(surface);
+  renameSurface(surface, name);
+  rebalanceSurfaces();
+  return surface;
+}
+
+/** Label the pane with the subagent's name. Cosmetic; never fatal. */
+function renameSurface(surface: string, name: string): void {
+  try {
+    herdrCli(["pane", "rename", surface, name]);
+  } catch {}
+}
+
+/**
+ * Create a new split in the given direction from an optional source pane.
+ * Returns the new pane id (e.g. `w3:p2`).
+ *
+ * herdr only splits `right` and `down` (no "before" splits), so `left`/`up`
+ * collapse onto their axis counterparts.
+ */
+export function createSurfaceSplit(
+  name: string,
+  direction: "left" | "right" | "up" | "down",
+  fromSurface?: string,
+): string {
+  void name; // named after the split, via `pane rename`.
+  requireHerdr();
+
+  const args = ["pane", "split", "--no-focus", "--direction"];
+  args.push(direction === "up" || direction === "down" ? "down" : "right");
+  if (fromSurface) {
+    args.push("--pane", fromSurface);
+  } else {
+    args.push("--current");
+  }
+
+  const out = herdrCli(args);
+  const paneId = JSON.parse(out)?.result?.pane?.pane_id;
+  if (typeof paneId !== "string" || paneId === "") {
+    throw new Error(`Unexpected herdr pane split output: ${out}`);
+  }
+  return paneId;
+}
+
+/**
+ * Send a command string to a pane and execute it.
+ * `pane run` types the command literally and submits it in one call.
+ */
+export function sendCommand(surface: string, command: string): void {
+  requireHerdr();
+  herdrCli(["pane", "run", surface, command]);
+}
+
+/**
+ * Send a long command to a pane by writing it to a script file first.
+ * This avoids terminal line-wrapping issues that break commands exceeding the
+ * pane's column width when sent character-by-character via sendCommand.
+ *
+ * By default the script is written to a temp directory, but callers can pass a
+ * stable path (for example under session artifacts) so the exact invocation is
+ * preserved for debugging.
+ *
+ * Returns the script path.
+ */
+export function sendLongCommand(
+  surface: string,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+  const scriptPath =
+    options?.scriptPath ??
+    join(
+      tmpdir(),
+      "pi-subagent-scripts",
+      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
+    );
+  mkdirSync(dirname(scriptPath), { recursive: true });
+
+  const scriptParts = ["#!/bin/bash"];
+  if (options?.scriptPreamble) {
+    scriptParts.push(options.scriptPreamble.trimEnd());
+  }
+  scriptParts.push(command);
+
+  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
+    mode: 0o755,
+  });
+  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  return scriptPath;
+}
+
+
+/**
+ * Read the screen contents of a pane (sync).
+ *
+ * `recent-unwrapped` joins rows the terminal soft-wrapped, so a narrow pane
+ * can't split `__SUBAGENT_DONE_0__` (or a summary line) across rows and defeat
+ * the callers' regexes. It only covers output produced since the pane's last
+ * command started, so a pane that has printed nothing yet reads empty —
+ * fall back to the raw visible screen there.
+ */
+export function readScreen(surface: string, lines = 50): string {
+  requireHerdr();
+  try {
+    const out = herdrCli(readArgs(surface, lines, "recent-unwrapped"));
+    if (out.trim() !== "") return out;
+  } catch {
+    // A recent read of more rows than fit on screen drives a recognized
+    // agent's own scrollback, and errors with agent_not_idle while it works.
+  }
+  return herdrCli(readArgs(surface, lines, "visible"));
+}
+
+/**
+ * Read the screen contents of a pane (async).
+ */
+export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
+  requireHerdr();
+  try {
+    const { stdout } = await execFileAsync("herdr", readArgs(surface, lines, "recent-unwrapped"), {
+      encoding: "utf8",
+    });
+    if (stdout.trim() !== "") return stdout;
+  } catch {}
+  const fallback = await execFileAsync("herdr", readArgs(surface, lines, "visible"), {
+    encoding: "utf8",
+  });
+  return fallback.stdout;
+}
+
+function readArgs(surface: string, lines: number, source: string): string[] {
+  return ["pane", "read", surface, "--source", source, "--lines", String(Math.max(1, lines))];
+}
+
+/**
+ * Close a pane.
+ */
+export function closeSurface(surface: string): void {
+  requireHerdr();
+  ownedSurfaces.delete(surface);
+  herdrCli(["pane", "close", surface]);
+  rebalanceSurfaces();
+}
+
+// ── Exit polling ──
+
+export interface PollResult {
+  /** How the subagent exited */
+  reason: "done" | "sentinel" | "error";
+  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  exitCode: number;
+  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
+  errorMessage?: string;
+}
+
+/**
+ * Interpret an `.exit` sidecar payload (written by the error path in
+ * subagent-done.ts). Centralized so both the fast and slow paths in
+ * pollForExit decode the payload the same way. Clean completions write no
+ * sidecar and are detected via the terminal sentinel instead.
+ *
+ * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
+ * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
+ */
+function interpretExitSidecar(data: any): PollResult {
+  if (data?.type === "error") {
+    const errorMessage =
+      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
+        ? data.errorMessage
+        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
+    return { reason: "error", exitCode: 1, errorMessage };
+  }
+  return { reason: "done", exitCode: 0 };
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar };
+
+/**
+ * Poll until the subagent exits. Checks for a `.exit` sidecar file first
+ * (written by the error path), falling back to the terminal sentinel for
+ * clean-completion and crash detection.
+ */
+export async function pollForExit(
+  surface: string,
+  signal: AbortSignal,
+  options: {
+    interval: number;
+    sessionFile?: string;
+    sentinelFile?: string;
+    onTick?: (elapsed: number) => void;
+  },
+): Promise<PollResult> {
+  const start = Date.now();
+
+  for (;;) {
+    if (signal.aborted) {
+      throw new Error("Aborted while waiting for subagent to finish");
+    }
+
+    // Fast path: check for .exit sidecar file (written by the error path)
+    if (options.sessionFile) {
+      try {
+        const exitFile = `${options.sessionFile}.exit`;
+        if (existsSync(exitFile)) {
+          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+          rmSync(exitFile, { force: true });
+          return interpretExitSidecar(data);
+        }
+      } catch {}
+    }
+
+    // Check Claude sentinel file (written by plugin Stop hook)
+    if (options.sentinelFile) {
+      try {
+        if (existsSync(options.sentinelFile)) {
+          return { reason: "sentinel", exitCode: 0 };
+        }
+      } catch {}
+    }
+
+    // Slow path: read terminal screen for sentinel (crash detection)
+    try {
+      const screen = await readScreenAsync(surface, 5);
+      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+      if (match) {
+        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      }
+    } catch {
+      // Surface may have been destroyed — check if .exit file appeared in the meantime
+      if (options.sessionFile) {
+        try {
+          const exitFile = `${options.sessionFile}.exit`;
+          if (existsSync(exitFile)) {
+            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+            rmSync(exitFile, { force: true });
+            return interpretExitSidecar(data);
+          }
+        } catch {}
+      }
+    }
+
+    const elapsed = Math.floor((Date.now() - start) / 1000);
+    options.onTick?.(elapsed);
+
+    await new Promise<void>((resolve, reject) => {
+      if (signal.aborted) return reject(new Error("Aborted"));
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, options.interval);
+      function onAbort() {
+        clearTimeout(timer);
+        reject(new Error("Aborted"));
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+}

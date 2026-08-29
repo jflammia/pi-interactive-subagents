@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether herdr is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in herdr panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -32,9 +32,9 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+} from "../../pi-extension/subagents/herdr.ts";
 
-// Re-export tmux primitives for tests
+// Re-export herdr primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -76,43 +76,28 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
+ * Detect whether herdr is available in the current environment.
+ * Returns ["herdr"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  return isMuxAvailable() ? ["herdr"] : [];
 }
 
-export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
-}
-
+/**
+ * The pane herdr currently has focused, or null.
+ *
+ * herdr's CLI can only focus a *neighbor* by direction (`pane focus
+ * --direction`), so there is no focusSurface(id) counterpart — tests assert
+ * that focus does not move rather than driving it.
+ */
 export function getFocusedSurface(): string | null {
   try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-      encoding: "utf8",
-    });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-    return activeLine?.split(" ")[0] ?? null;
+    const out = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
+    const panes = JSON.parse(out)?.result?.panes ?? [];
+    return panes.find((p: any) => p.focused)?.pane_id ?? null;
   } catch {
     return null;
   }
-}
-
-export async function waitForFocusedSurface(
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    if (getFocusedSurface() === surface) return;
-    await sleep(200);
-  }
-
-  throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
-      `current focus is ${getFocusedSurface() ?? "unknown"}`,
-  );
 }
 
 // ── Test environment ──

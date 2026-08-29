@@ -24,7 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+} from "./herdr.ts";
 
 import {
   countSessionEntryLines,
@@ -508,10 +508,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require herdr. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "herdr not available" },
   };
 }
 
@@ -1008,7 +1008,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via herdr: ` +
         `${error?.message ?? String(error)}`,
     };
   }
