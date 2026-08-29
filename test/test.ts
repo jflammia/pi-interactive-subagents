@@ -34,7 +34,7 @@ import {
   shellEscape,
   chooseSplit,
   evenSplitRatios,
-  agentLabel,
+  canonicalSubagentName,
   type LayoutNode,
 } from "../pi-extension/subagents/herdr.ts";
 import {
@@ -2809,27 +2809,70 @@ describe("herdr.ts evenSplitRatios", () => {
   });
 });
 
-describe("herdr.ts agentLabel", () => {
-  // herdr agent labels must match [a-z][a-z0-9_-]{0,31}; subagent names are
-  // free-form, so a name herdr would reject must never break a state report.
-  it("passes a already-valid name through", () => {
-    assert.equal(agentLabel("scout-1"), "scout-1");
+describe("uniqueRunningName stays inside herdr's label limit", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("disambiguates without overflowing 32 characters", () => {
+    const base = "a".repeat(32);
+    testApi.reservedNames.add(base);
+    try {
+      const second = testApi.uniqueRunningName(base);
+      assert.equal(second.length <= 32, true, `got ${second.length} chars: ${second}`);
+      assert.match(second, /^[a-z][a-z0-9_-]{0,31}$/);
+      assert.notEqual(second, base);
+    } finally {
+      testApi.reservedNames.delete(base);
+    }
   });
 
-  it("lowercases and replaces spaces and punctuation", () => {
-    assert.equal(agentLabel("Scout Agent #1"), "scout-agent--1");
+  it("keeps short names untouched apart from the suffix", () => {
+    testApi.reservedNames.add("scout");
+    try {
+      assert.equal(testApi.uniqueRunningName("scout"), "scout-2");
+    } finally {
+      testApi.reservedNames.delete("scout");
+    }
+  });
+});
+
+describe("herdr.ts canonicalSubagentName", () => {
+  // One shape for the widget row, the pane label, the herdr agent label and
+  // the generated filenames: herdr's [a-z][a-z0-9_-]{0,31}.
+  it("passes an already-canonical name through", () => {
+    assert.equal(canonicalSubagentName("scout-1"), "scout-1");
+    assert.equal(canonicalSubagentName("code_reviewer"), "code_reviewer");
+  });
+
+  it("lowercases and hyphenates a free-form name", () => {
+    assert.equal(canonicalSubagentName("Scout Agent 1"), "scout-agent-1");
+  });
+
+  it("collapses runs of punctuation into a single hyphen", () => {
+    assert.equal(canonicalSubagentName("Scout   Agent #1"), "scout-agent-1");
   });
 
   it("drops leading characters that cannot start a label", () => {
-    assert.equal(agentLabel("2nd-reviewer"), "nd-reviewer");
+    assert.equal(canonicalSubagentName("2nd-reviewer"), "nd-reviewer");
+  });
+
+  it("leaves no trailing hyphen", () => {
+    assert.equal(canonicalSubagentName("reviewer!!"), "reviewer");
+    assert.equal(canonicalSubagentName("a".repeat(31) + " tail"), "a".repeat(31));
   });
 
   it("falls back rather than emitting an empty label", () => {
-    assert.equal(agentLabel("***"), "subagent");
-    assert.equal(agentLabel(""), "subagent");
+    assert.equal(canonicalSubagentName("***"), "subagent");
+    assert.equal(canonicalSubagentName(""), "subagent");
   });
 
   it("truncates to herdr's 32-character limit", () => {
-    assert.equal(agentLabel("a".repeat(50)).length, 32);
+    assert.equal(canonicalSubagentName("a".repeat(50)).length, 32);
+  });
+
+  it("produces a filename-safe string", () => {
+    // The launch script and task artifact are named straight from it.
+    for (const raw of ["../../etc/passwd", "name with spaces", "Weird/Name*?"]) {
+      assert.match(canonicalSubagentName(raw), /^[a-z][a-z0-9_-]{0,31}$/);
+    }
   });
 });

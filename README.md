@@ -212,6 +212,17 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
+## Sub-agent names
+
+A sub-agent's name is canonicalized once at spawn to herdr's agent-label
+pattern, `[a-z][a-z0-9_-]{0,31}` — `"Scout Agent 1"` becomes `scout-agent-1`.
+That single string is then the widget row, the pane label, the herdr agent
+label, and the launch-script and task-artifact filenames, so nothing downstream
+needs its own sanitizer. Names omitted by the caller default to the agent name
+(already in that shape) and are disambiguated as `scout-2`, `scout-3`, …, never
+exceeding the 32-character limit. `subagent_message` accepts either the
+canonical name or the free-form one the caller originally passed.
+
 ## herdr agent state
 
 Sub-agent panes report their lifecycle to herdr — `working`, `idle`, `unknown` —

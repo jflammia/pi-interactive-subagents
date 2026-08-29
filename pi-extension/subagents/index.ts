@@ -26,6 +26,7 @@ import {
   readScreen,
   reportAgentState,
   releaseAgentState,
+  canonicalSubagentName,
   type SurfacePlacement,
   type AgentReportState,
 } from "./herdr.ts";
@@ -107,6 +108,8 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
+        "Lowercased and hyphenated to `[a-z][a-z0-9_-]{0,31}` (\"Scout Agent 1\" becomes \"scout-agent-1\"); " +
+        "the result is returned to you and is the name to use with subagent_message. " +
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
@@ -1016,9 +1019,13 @@ function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   for (const reserved of reservedNames) taken.add(reserved);
   if (registryNames) for (const n of registryNames) taken.add(n);
   if (!taken.has(base)) return base;
-  let n = 2;
-  while (taken.has(`${base}-${n}`)) n++;
-  return `${base}-${n}`;
+  // Keep the disambiguated name inside herdr's 32-character label limit, so
+  // "…-2" and "…-3" can never truncate to the same agent label.
+  for (let n = 2; ; n++) {
+    const suffix = `-${n}`;
+    const candidate = base.slice(0, 32 - suffix.length).replace(/-+$/, "") + suffix;
+    if (!taken.has(candidate)) return candidate;
+  }
 }
 
 function resolveRunningByName(name: string):
@@ -1029,7 +1036,12 @@ function resolveRunningByName(name: string):
     return { error: "Provide the exact display name of a running subagent." };
   }
 
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  // Match the canonical form too, so a caller that remembers the name it typed
+  // ("Scout Agent 1") still reaches the subagent registered as "scout-agent-1".
+  const canonical = canonicalSubagentName(requestedName);
+  const matches = Array.from(runningSubagents.values()).filter(
+    (running) => running.name === requestedName || running.name === canonical,
+  );
   if (matches.length === 1) return { running: matches[0] };
   if (matches.length === 0) {
     const names = Array.from(runningSubagents.values()).map((r) => r.name);
@@ -1325,12 +1337,7 @@ async function launchSubagent(
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
     sendLongCommand(surface, command, {
@@ -1440,13 +1447,7 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+    const artifactName = `context/${params.name || "subagent"}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
@@ -1467,12 +1468,7 @@ async function launchSubagent(
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
@@ -1843,10 +1839,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // every name already in the registry — so names stay unique across the
         // whole session, running or finished. Reserve the chosen name
         // synchronously (before any await) so parallel spawns don't collide.
+        // Canonicalize a caller-supplied name to the one shape every consumer
+        // wants (see canonicalSubagentName). Uniqueness then runs on that
+        // shape, and the pane label, herdr agent label and generated filenames
+        // are all just `params.name`.
+        if (params.name?.trim()) {
+          params.name = canonicalSubagentName(params.name);
+        }
+
         let reservedName: string | null = null;
         if (!params.name?.trim()) {
           const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-          params.name = uniqueRunningName(params.agent, registryNames);
+          params.name = uniqueRunningName(canonicalSubagentName(params.agent), registryNames);
           reservedName = params.name;
           reservedNames.add(reservedName);
         }

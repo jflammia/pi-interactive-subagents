@@ -227,10 +227,23 @@ export type AgentReportState = "working" | "idle" | "blocked" | "unknown";
 /** herdr ignores stale reports from the same source by sequence number. */
 let reportSeq = 0;
 
-/** herdr agent labels: `[a-z][a-z0-9_-]{0,31}`. */
-export function agentLabel(name: string): string {
-  const cleaned = name.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^[^a-z]+/, "");
-  return (cleaned || "subagent").slice(0, 32);
+/**
+ * The one name shape a subagent uses everywhere: herdr's agent-label pattern,
+ * `[a-z][a-z0-9_-]{0,31}`.
+ *
+ * Subagent names are canonicalized to this at spawn, so the same string serves
+ * as the widget row, the pane label, the herdr agent label, and the launch
+ * script / task artifact filenames — instead of each consumer sanitizing the
+ * raw name its own slightly different way.
+ */
+export function canonicalSubagentName(name: string): string {
+  const cleaned = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[^a-z]+/, "")
+    .replace(/-+$/, "");
+  return (cleaned || "subagent").slice(0, 32).replace(/-+$/, "");
 }
 
 /**
@@ -257,7 +270,7 @@ export function reportAgentState(
     herdrCli([
       "pane", "report-agent", surface,
       "--source", AGENT_SOURCE,
-      "--agent", agentLabel(name),
+      "--agent", canonicalSubagentName(name),
       "--state", state,
       "--seq", String(++reportSeq),
       ...(message ? ["--message", message.slice(0, 120)] : []),
@@ -271,7 +284,7 @@ export function releaseAgentState(surface: string, name: string): void {
     herdrCli([
       "pane", "release-agent", surface,
       "--source", AGENT_SOURCE,
-      "--agent", agentLabel(name),
+      "--agent", canonicalSubagentName(name),
     ]);
   } catch {}
 }
