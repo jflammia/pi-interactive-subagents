@@ -32,10 +32,105 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
+/**
+ * Entry types that are parent-orchestrator artifacts and must be pruned from a
+ * forked child's context. Keeping them would leak the parent's subagent tool
+ * calls, status pings, and control messages into the child — confusing the
+ * child's model and polluting its context with orchestration noise it has no
+ * use for. Ordinary prose, tool calls, and tool results are preserved.
+ *
+ * This mirrors pi-subagents' `pruned-fork.ts` approach: strip the orchestrator's
+ * machinery, keep the human/assistant conversation.
+ */
+const PARENT_ONLY_MESSAGE_TYPES = new Set([
+  "subagent_result",
+  "subagent_status",
+  "subagent_question",
+  "subagent_parallel",
+  "subagent_parallel_result",
+]);
+
+/**
+ * Tool names that belong to the subagent orchestration layer. A forked child
+ * should not see the parent's calls to these — they are parent-side control,
+ * not conversation the child needs to inherit.
+ */
+const ORCHESTRATOR_TOOLS = new Set([
+  "subagent",
+  "subagent_message",
+  "subagents_list",
+  "subagent_parallel",
+]);
+
+/**
+ * Determine whether a session entry line should be kept in a forked child's
+ * context. Returns true for ordinary conversation (human messages, assistant
+ * messages with prose/tool calls that aren't orchestrator-only), and false for
+ * parent-only orchestration artifacts.
+ */
+function shouldKeepForFork(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return true;
+  const e = entry as Record<string, unknown>;
+
+  // Always drop session headers (the fork gets its own).
+  if (e.type === "session") return false;
+
+  // Drop parent-only message types (steer-delivered subagent results/status).
+  if (typeof e.customType === "string" && PARENT_ONLY_MESSAGE_TYPES.has(e.customType)) {
+    return false;
+  }
+
+  // Only filter message entries further.
+  if (e.type !== "message") return true;
+  const msg = e.message as Record<string, unknown> | undefined;
+  if (!msg) return true;
+
+  const role = msg.role;
+  const content = msg.content;
+
+  // A user message whose content is entirely tool results from orchestrator
+  // tools is the parent's subagent-result delivery — drop it.
+  if (role === "user" && Array.isArray(content)) {
+    const blocks = content as Record<string, unknown>[];
+    if (blocks.length > 0 && blocks.every((b) => b.type === "toolResult")) {
+      // Check if any of these tool results came from orchestrator tools.
+      // The toolCallId on a toolResult doesn't carry the tool name directly,
+      // but the preceding assistant message's toolCall does. Since we can't
+      // easily cross-reference here, we use a heuristic: if the toolResult
+      // content mentions subagent orchestration markers, drop it. This is
+      // conservative — we'd rather keep a borderline message than drop real
+      // conversation.
+      const text = blocks
+        .map((b) => (typeof b.text === "string" ? b.text : ""))
+        .join("");
+      if (text.startsWith("Sub-agent ") || text.includes("subagent_message({ name:")) {
+        return false;
+      }
+    }
+  }
+
+  // An assistant message whose content is entirely orchestrator tool calls
+  // (subagent/subagent_message) is the parent spawning — drop it.
+  if (role === "assistant" && Array.isArray(content)) {
+    const blocks = content as Record<string, unknown>[];
+    if (blocks.length > 0 && blocks.every((b) => b.type === "toolCall")) {
+      const toolNames = blocks.map((b) => b.name).filter((n): n is string => typeof n === "string");
+      if (toolNames.length > 0 && toolNames.every((n) => ORCHESTRATOR_TOOLS.has(n))) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
 
+  // Truncate at the last user message — the fork should not inherit the
+  // parent's most recent prompt (the child gets its own task). This matches
+  // the original behavior.
   let truncateAt = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
@@ -51,9 +146,10 @@ function getForkContentLines(parentSessionFile: string): string[] {
 
   return lines.slice(0, truncateAt).filter((line) => {
     try {
-      return JSON.parse(line).type !== "session";
+      const entry = JSON.parse(line);
+      return shouldKeepForFork(entry);
     } catch {
-      return true;
+      return true; // keep malformed lines as-is
     }
   });
 }
@@ -114,6 +210,12 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /** JSON Schema object for structured output validation, or null. */
+  outputSchema: unknown | null;
+  /** Whether this subagent runs in an isolated git worktree. */
+  worktree: boolean;
+  /** CLI runner: "pi" (default), "claude", "codex", or "cursor". */
+  cli: string | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

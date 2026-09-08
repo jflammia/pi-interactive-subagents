@@ -66,6 +66,8 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { createWorktree, removeWorktree } from "./worktree.ts";
+import { extractStructuredOutput } from "./output-schema.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -146,6 +148,10 @@ interface AgentDefaults {
   cli?: string;
   body?: string;
   disableModelInvocation?: boolean;
+  /** When true, spawn this subagent in an isolated git worktree. */
+  worktree?: boolean;
+  /** JSON Schema object for structured output validation, or null. */
+  outputSchema?: unknown;
 }
 
 type AgentSource = "package" | "global" | "project";
@@ -169,6 +175,7 @@ const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
   "subagents_list",
+  "subagent_parallel",
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
@@ -267,6 +274,25 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
+/** Parse an output-schema frontmatter value as a JSON object. */
+function parseOutputSchema(value: string | undefined): unknown | undefined {
+  if (value == null) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch {
+    // Not valid JSON — could be a path to a schema file. Try reading it.
+    try {
+      const content = readFileSync(value, "utf8");
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      // Give up — no schema.
+    }
+  }
+  return undefined;
+}
+
 /** Parse a comma-separated frontmatter value into a trimmed list (or undefined). */
 function parseCommaList(value: string | undefined): string[] | undefined {
   if (value == null) return undefined;
@@ -316,6 +342,8 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+    worktree: parseOptionalBoolean(getFrontmatterValue(frontmatter, "worktree")),
+    outputSchema: parseOutputSchema(getFrontmatterValue(frontmatter, "output-schema") ?? getFrontmatterValue(frontmatter, "output_schema")),
   };
 }
 
@@ -609,6 +637,12 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** Structured output: the validated JSON object when the agent has an outputSchema. */
+  structuredOutput?: unknown;
+  /** Validation error when structured output extraction failed. */
+  structuredOutputError?: string;
+  /** Path to the git worktree, if the subagent ran in one. */
+  worktreePath?: string;
 }
 
 /**
@@ -643,6 +677,10 @@ interface RunningSubagent {
   interactive: boolean;
   /** Last lifecycle state reported to herdr, so we only report transitions. */
   herdrState?: AgentReportState;
+  /** Path to the git worktree this subagent runs in, if worktree isolation is on. */
+  worktreePath?: string;
+  /** JSON Schema for structured output validation, if the agent declares one. */
+  outputSchema?: unknown;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1253,6 +1291,21 @@ async function launchSubagent(
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
+  // Worktree isolation: if the agent declares `worktree: true`, create a git
+  // worktree so this subagent edits in its own checkout. Parallel workers
+  // won't collide on the same files. The worktree is cleaned up when the
+  // subagent completes (see watchSubagent).
+  let worktreePath: string | undefined;
+  let effectiveCwdForLaunch = effectiveCwd;
+  if (agentDefs?.worktree) {
+    try {
+      worktreePath = createWorktree(targetCwdForSession, params.name || params.agent || "subagent");
+      effectiveCwdForLaunch = worktreePath;
+    } catch (err: any) {
+      throw new Error(`Failed to create worktree for subagent: ${err?.message ?? String(err)}`);
+    }
+  }
+
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
   // each agent knows exactly which file is theirs.
@@ -1269,7 +1322,7 @@ async function launchSubagent(
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
   const surface =
-    options?.surface ?? createSurface(params.name, agentDefs?.panePlacement, effectiveCwd);
+    options?.surface ?? createSurface(params.name, agentDefs?.panePlacement, effectiveCwdForLaunch);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1308,18 +1361,34 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
-    const sentinelFile = `/tmp/pi-claude-${id}-done`;
+  // ── External CLI paths (Claude Code, Codex, Cursor) ──
+  // Each CLI gets its own launch command but shares the same sentinel
+  // mechanism: the wrapper prints `__SUBAGENT_DONE_<exitcode>__` on exit.
+  if (agentDefs?.cli && agentDefs.cli !== "pi") {
+    const cliName = agentDefs.cli;
+    const sentinelFile = `/tmp/pi-subagent-${cliName}-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-    cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
 
-    if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+    switch (cliName) {
+      case "claude":
+        cmdParts.push("claude");
+        cmdParts.push("--dangerously-skip-permissions");
+        if (existsSync(pluginDir)) {
+          cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+        }
+        break;
+      case "codex":
+        cmdParts.push("codex");
+        cmdParts.push("exec");
+        break;
+      case "cursor":
+        cmdParts.push("cursor-agent");
+        break;
+      default:
+        throw new Error(`Unknown CLI runner: ${cliName}. Supported: claude, codex, cursor.`);
     }
 
     if (effectiveModel) {
@@ -1328,23 +1397,21 @@ async function launchSubagent(
 
     const sp = agentDefs.body;
     if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
+      const promptFlag = cliName === "codex" ? "--system-prompt" : "--append-system-prompt";
+      cmdParts.push(promptFlag, shellEscape(sp));
     }
 
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
+    // Always pass the task as the prompt.
     cmdParts.push(shellEscape(params.task));
 
-    // No `cd` prefix: createSurface() opened the pane in effectiveCwd.
     const command = `${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-
     const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
+        `# ${cliName} subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
         `# Surface: ${surface}`,
       ].join("\n"),
@@ -1359,13 +1426,15 @@ async function launchSubagent(
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
-      cli: "claude",
+      cli: cliName,
       sentinelFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
-        source: "claude",
+        source: cliName,
         startTimeMs: startTime,
       }),
+      ...(worktreePath ? { worktreePath } : {}),
+      ...(agentDefs.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
     };
 
     runningSubagents.set(id, running);
@@ -1407,8 +1476,11 @@ async function launchSubagent(
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
     autoExit: agentDefs?.autoExit ?? false,
-    cwd: effectiveCwd ?? null,
+    cwd: effectiveCwdForLaunch ?? null,
     agentDir: resolvedAgentDir,
+    outputSchema: agentDefs?.outputSchema ?? null,
+    worktree: agentDefs?.worktree ?? false,
+    cli: agentDefs?.cli ?? null,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -1497,6 +1569,8 @@ async function launchSubagent(
       source: "pi",
       startTimeMs: startTime,
     }),
+    ...(worktreePath ? { worktreePath } : {}),
+    ...(agentDefs?.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
   };
 
   runningSubagents.set(id, running);
@@ -1627,9 +1701,10 @@ async function watchSubagent(
 
       finishHerdrAgentState(running);
       closeSurface(surface);
+      if (running.worktreePath) removeWorktree(running.worktreePath);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(running.worktreePath ? { worktreePath: running.worktreePath } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1654,8 +1729,22 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
+    // Structured output validation: if the agent declared an outputSchema,
+    // try to parse and validate the final assistant message as JSON.
+    let structuredOutput: unknown | undefined;
+    let structuredOutputError: string | undefined;
+    if (running.outputSchema && summary) {
+      const result = extractStructuredOutput(summary, running.outputSchema);
+      if (result.ok) {
+        structuredOutput = result.value;
+      } else {
+        structuredOutputError = result.error;
+      }
+    }
+
     finishHerdrAgentState(running);
     closeSurface(surface);
+    if (running.worktreePath) removeWorktree(running.worktreePath);
     runningSubagents.delete(running.id);
 
     return {
@@ -1668,12 +1757,16 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
+      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+      ...(structuredOutputError ? { structuredOutputError } : {}),
+      ...(running.worktreePath ? { worktreePath: running.worktreePath } : {}),
     };
   } catch (err: any) {
     try {
       finishHerdrAgentState(running);
       closeSurface(surface);
     } catch {}
+    if (running.worktreePath) removeWorktree(running.worktreePath);
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -1912,6 +2005,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
+                  ...(result.structuredOutput !== undefined ? { structuredOutput: result.structuredOutput } : {}),
+                  ...(result.structuredOutputError ? { structuredOutputError: result.structuredOutputError } : {}),
+                  ...(result.worktreePath ? { worktreePath: result.worktreePath } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2388,7 +2484,214 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent command — spawn a subagent by name
+  // ── subagent_parallel tool ──
+  // Declarative parallel fanout: spawn N subagents at once, each in its own
+  // pane (and worktree if the agent declares one). Results are delivered
+  // individually as steer messages as each completes — the tool returns
+  // immediately with a list of launched names. This is the lightweight
+  // equivalent of pi-subagents' `runs.all()` without the JS sandbox: a
+  // simple array of { key, agent, task } objects.
+  pi.registerTool({
+      name: "subagent_parallel",
+      label: "Parallel Subagents",
+      description:
+        "Spawn multiple subagents in parallel. Each runs in its own pane with its own task. " +
+        "Results are delivered individually as steer messages as each subagent finishes — " +
+        "you do NOT need to poll or wait. Pass a `tasks` array of { key, agent, task } objects. " +
+        "Optionally set `worktree: true` to give each subagent its own git worktree (recommended " +
+        "for agents that edit files, to avoid conflicts). Returns immediately with the list of " +
+        "launched subagent names.",
+      promptSnippet:
+        "Spawn multiple subagents in parallel. Each gets its own pane and task. Results arrive as " +
+        "steer messages. Pass tasks: [{ key, agent, task }, ...]. Set worktree: true for edit-safe isolation.",
+      parameters: Type.Object({
+        tasks: Type.Array(
+          Type.Object({
+            key: Type.String({ description: "Unique key for this task within the batch (used in result delivery)." }),
+            agent: Type.String({ description: "Agent to spawn (e.g. 'scout', 'worker')." }),
+            task: Type.String({ description: "Task/prompt for this sub-agent." }),
+            name: Type.Optional(Type.String({ description: "Optional cosmetic label. Defaults to the key." })),
+            model: Type.Optional(Type.String({ description: "Model override." })),
+            cwd: Type.Optional(Type.String({ description: "Working directory override." })),
+          }),
+        ),
+        worktree: Type.Optional(
+          Type.Boolean({
+            description: "If true, each subagent gets its own git worktree. Recommended for agents that edit files.",
+          }),
+        ),
+      }),
+
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (!isMuxAvailable()) return muxUnavailableResult();
+        if (!ctx.sessionManager.getSessionFile()) {
+          return {
+            content: [{ type: "text" as const, text: "Error: no session file. Start pi with a persistent session to use subagents." }],
+            details: { error: "no session file" },
+          };
+        }
+        if (!params.tasks || params.tasks.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "`tasks` must be a non-empty array of { key, agent, task } objects." }],
+            details: { error: "empty tasks" },
+          };
+        }
+
+        // Validate all agents first — fail the whole batch if any is unknown,
+        // rather than spawning a partial set.
+        const permittedAgents = SUBAGENT_ALLOWLIST
+          ? [...SUBAGENT_ALLOWLIST]
+          : discoverAgentDefinitions().map((a) => a.name);
+        const permittedSet = new Set(permittedAgents);
+        for (const t of params.tasks) {
+          if (!permittedSet.has(t.agent)) {
+            return {
+              content: [{ type: "text" as const, text: `Agent "${t.agent}" is not available. Available: ${permittedAgents.join(", ")}.` }],
+              details: { error: `unknown agent: ${t.agent}` },
+            };
+          }
+        }
+
+        // Check for duplicate keys.
+        const seenKeys = new Set<string>();
+        for (const t of params.tasks) {
+          if (seenKeys.has(t.key)) {
+            return {
+              content: [{ type: "text" as const, text: `Duplicate task key: "${t.key}". Keys must be unique within a batch.` }],
+              details: { error: `duplicate key: ${t.key}` },
+            };
+          }
+          seenKeys.add(t.key);
+        }
+
+        const parentArtifactDir = getArtifactDir(
+          ctx.sessionManager.getSessionDir(),
+          ctx.sessionManager.getSessionId(),
+        );
+
+        const launched: Array<{ key: string; name: string; agent: string }> = [];
+
+        // Spawn each subagent. Surfaces are created sequentially (herdr pane
+        // splits are fast ~4ms each), but the subagents run in parallel once
+        // launched. The `worktree` param overrides each agent's own setting.
+        for (const t of params.tasks) {
+          const displayName = canonicalSubagentName(t.name || t.key);
+          // Ensure uniqueness across running + registered names.
+          const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+          const uniqueName = uniqueRunningName(displayName, registryNames);
+          reservedNames.add(uniqueName);
+
+          try {
+            // Apply worktree override: if the caller set worktree:true, inject
+            // it into the agent defs for this spawn.
+            const agentDefs = loadAgentDefaults(t.agent);
+            const effectiveAgentDefs = params.worktree
+              ? { ...agentDefs, worktree: true }
+              : agentDefs;
+
+            const running = await launchSubagent(
+              { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd },
+              ctx,
+            );
+
+            registerName(parentArtifactDir, running.name, {
+              sessionFile: running.sessionFile,
+              sessionId: getSessionId(running.sessionFile),
+            });
+
+            const watcherAbort = new AbortController();
+            running.abortController = watcherAbort;
+            startWidgetRefresh();
+            startStatusRefresh(pi);
+
+            // Fire-and-forget watcher. The result is delivered as a steer
+            // message with the task key in details so the orchestrator can
+            // correlate it back to the original batch.
+            watchSubagent(running, watcherAbort.signal)
+              .then((result) => {
+                updateWidget();
+                const presentation = resolveResultPresentation(result, running.name);
+                pi.sendMessage(
+                  {
+                    customType: "subagent_parallel_result",
+                    content: `[${t.key}] ${presentation}`,
+                    display: true,
+                    details: {
+                      key: t.key,
+                      name: running.name,
+                      task: running.task,
+                      agent: running.agent,
+                      exitCode: result.exitCode,
+                      elapsed: result.elapsed,
+                      ...(result.structuredOutput !== undefined ? { structuredOutput: result.structuredOutput } : {}),
+                      ...(result.structuredOutputError ? { structuredOutputError: result.structuredOutputError } : {}),
+                      ...(result.stats ? { stats: result.stats } : {}),
+                    },
+                  },
+                  { triggerTurn: true, deliverAs: "steer" },
+                );
+              })
+              .catch((err) => {
+                updateWidget();
+                pi.sendMessage(
+                  {
+                    customType: "subagent_parallel_result",
+                    content: `[${t.key}] Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                    display: true,
+                    details: { key: t.key, name: running.name, error: err?.message },
+                  },
+                  { triggerTurn: true, deliverAs: "steer" },
+                );
+              });
+
+            launched.push({ key: t.key, name: uniqueName, agent: t.agent });
+          } finally {
+            reservedNames.delete(uniqueName);
+          }
+        }
+
+        const namesList = launched.map((l) => `${l.key}: ${l.name}`).join(", ");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Spawned ${launched.length} subagents in parallel: ${namesList}. ` +
+                `Each result will be delivered as a steer message with its key when it finishes. ` +
+                `Do NOT poll or wait — move on to other work or end your turn.`,
+            },
+          ],
+          details: { launched, status: "started" },
+        };
+      },
+
+      renderCall(args, theme) {
+        const tasks = (args as Record<string, unknown>)?.tasks as Array<Record<string, unknown>> | undefined;
+        const count = Array.isArray(tasks) ? tasks.length : 0;
+        return new Text(
+          theme.fg("accent", "⟳") +
+            " " +
+            theme.fg("toolTitle", theme.bold(`Parallel (${count})`)) +
+            theme.fg("dim", " — spawned"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        const launched = details?.launched as Array<{ key: string; name: string }> | undefined;
+        if (!launched || launched.length === 0) {
+          const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+          return new Text(theme.fg("dim", text), 0, 0);
+        }
+        const lines = launched.map(
+          (l) => `  ${theme.fg("toolTitle", l.key)} → ${theme.fg("dim", l.name)}`,
+        );
+        return new Text(lines.join("\n"), 0, 0);
+      },
+    });
+
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
     handler: async (args, ctx) => {
@@ -2584,6 +2887,55 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } else {
           const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
           contentLines.push(theme.fg("dim", preview));
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+
+        const box = new Box(1, 1, bgFn);
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
+  // ── subagent_parallel_result message renderer ──
+  pi.registerMessageRenderer("subagent_parallel_result", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const key = details.key ?? "?";
+        const name = details.name ?? "subagent";
+        const exitCode = details.exitCode ?? 0;
+        const failed = exitCode !== 0;
+        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+        const bgFn = failed
+          ? (text: string) => theme.bg("toolErrorBg", text)
+          : (text: string) => theme.bg("toolSuccessBg", text);
+        const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+
+        const header = `${icon} ${theme.fg("accent", `[${key}]`)} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", `— ${failed ? "failed" : "done"} · ${elapsed}`)}`;
+
+        const rawContent = typeof message.content === "string" ? message.content : "";
+        // Strip the [key] prefix and the standard result presentation for display.
+        const summary = rawContent.replace(/^\[[^\]]+\]\s*/, "").replace(/\n\nFollow up with subagent_message[\s\S]+$/, "");
+
+        const contentLines = [header];
+        if (options.expanded) {
+          if (summary) {
+            for (const line of summary.split("\n").slice(0, 10)) {
+              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+            }
+          }
+          if (details.structuredOutput !== undefined) {
+            contentLines.push("");
+            contentLines.push(theme.fg("accent", "Structured output:"));
+            contentLines.push(theme.fg("dim", JSON.stringify(details.structuredOutput, null, 2).slice(0, 500)));
+          }
+        } else {
+          const preview = summary.split("\n")[0].slice(0, width - 10);
+          if (preview) contentLines.push(theme.fg("dim", preview));
           contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }
 
