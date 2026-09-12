@@ -732,7 +732,11 @@ function watchForSentinel(
     (error, stdout) => {
       signal.removeEventListener("abort", kill);
       if (signal.aborted) return;
-      const match = !error && stdout.match(/__SUBAGENT_DONE_(\d+)__/);
+      // Take the LAST sentinel in the buffer, not the first: a re-armed watch
+      // re-reads the same recent-output window, so an earlier run's sentinel
+      // in a reused pane would otherwise report a stale exit code.
+      const matches = error ? [] : [...stdout.matchAll(/__SUBAGENT_DONE_(\d+)__/g)];
+      const match = matches[matches.length - 1];
       if (match) {
         onExit(parseInt(match[1], 10));
         return;

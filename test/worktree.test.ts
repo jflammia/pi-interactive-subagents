@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createWorktree, removeWorktree, listSubagentWorktrees } from "../pi-extension/subagents/worktree.ts";
+import { createWorktree, finishWorktree, listSubagentWorktrees } from "../pi-extension/subagents/worktree.ts";
 
 function hasGit(): boolean {
   try {
@@ -21,6 +21,8 @@ function makeRepo(): string {
   execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
   execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: dir, stdio: "ignore" });
   execFileSync("git", ["config", "user.name", "Test"], { cwd: dir, stdio: "ignore" });
+  // The test repo must not inherit the user's commit signing — no agent here.
+  execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: dir, stdio: "ignore" });
   writeFileSync(join(dir, "README.md"), "# test\n");
   execFileSync("git", ["add", "."], { cwd: dir, stdio: "ignore" });
   execFileSync("git", ["commit", "-m", "init"], { cwd: dir, stdio: "ignore" });
@@ -42,34 +44,66 @@ test("createWorktree creates a working tree on a new branch", { skip: !hasGit() 
   }
 });
 
-test("removeWorktree deletes the worktree and branch", { skip: !hasGit() }, () => {
+test("finishWorktree removes the directory but keeps the branch", { skip: !hasGit() }, () => {
   const repo = makeRepo();
   try {
     const wt = createWorktree(repo, "worker-2");
     assert.ok(existsSync(wt));
 
-    removeWorktree(wt);
+    const outcome = finishWorktree(wt);
     assert.ok(!existsSync(wt), "worktree path should be gone after removal");
+    assert.ok(outcome?.branch.startsWith("pi-subagent/"), `expected a branch, got ${outcome?.branch}`);
+    assert.equal(outcome?.commit, undefined, "a clean worktree needs no commit");
 
-    // The branch should be deleted too.
+    // The branch survives so the work is recoverable.
     const branches = execFileSync("git", ["branch", "--list", "pi-subagent/*"], {
       cwd: repo,
       encoding: "utf8",
     }).trim();
-    assert.equal(branches, "", "no pi-subagent branches should remain");
+    assert.ok(branches.includes(outcome!.branch), `branch should remain, got: ${branches}`);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
 });
 
-test("removeWorktree is safe on already-removed paths", { skip: !hasGit() }, () => {
+test("finishWorktree commits work the subagent left uncommitted", { skip: !hasGit() }, () => {
+  const repo = makeRepo();
+  try {
+    const wt = createWorktree(repo, "worker-2b");
+    writeFileSync(join(wt, "NEW.md"), "# subagent output\n");
+    writeFileSync(join(wt, "README.md"), "# edited by subagent\n");
+
+    const outcome = finishWorktree(wt);
+    assert.ok(outcome?.commit, "dirty worktree should produce a commit");
+
+    // The work is readable from the branch after the worktree is gone.
+    const files = execFileSync("git", ["show", "--name-only", "--format=", outcome!.commit!], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    assert.ok(files.includes("NEW.md"), "untracked file should be committed");
+    assert.ok(files.includes("README.md"), "modified file should be committed");
+    const content = execFileSync("git", ["show", `${outcome!.branch}:README.md`], {
+      cwd: repo,
+      encoding: "utf8",
+    }).trim();
+    assert.equal(content, "# edited by subagent");
+
+    // ...and main is untouched.
+    const original = execFileSync("git", ["show", "HEAD:README.md"], { cwd: repo, encoding: "utf8" }).trim();
+    assert.equal(original, "# test");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("finishWorktree is safe on already-removed paths", { skip: !hasGit() }, () => {
   const repo = makeRepo();
   try {
     const wt = createWorktree(repo, "worker-3");
-    removeWorktree(wt);
-    // Calling again should not throw.
-    removeWorktree(wt);
-    removeWorktree("/nonexistent/path");
+    finishWorktree(wt);
+    assert.equal(finishWorktree(wt), null, "second call is a no-op");
+    assert.equal(finishWorktree("/nonexistent/path"), null);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

@@ -66,7 +66,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { createWorktree, removeWorktree } from "./worktree.ts";
+import { createWorktree, finishWorktree } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -641,8 +641,9 @@ interface SubagentResult {
   structuredOutput?: unknown;
   /** Validation error when structured output extraction failed. */
   structuredOutputError?: string;
-  /** Path to the git worktree, if the subagent ran in one. */
-  worktreePath?: string;
+  /** Branch holding the work, if the subagent ran in a worktree. The worktree
+   * directory itself is removed on completion; the branch is what survives. */
+  worktreeBranch?: string;
 }
 
 /**
@@ -1270,7 +1271,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; worktree?: boolean },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1293,11 +1294,11 @@ async function launchSubagent(
 
   // Worktree isolation: if the agent declares `worktree: true`, create a git
   // worktree so this subagent edits in its own checkout. Parallel workers
-  // won't collide on the same files. The worktree is cleaned up when the
-  // subagent completes (see watchSubagent).
+  // won't collide on the same files. On completion the worktree's work is
+  // committed to its branch and the directory is dropped (see watchSubagent).
   let worktreePath: string | undefined;
   let effectiveCwdForLaunch = effectiveCwd;
-  if (agentDefs?.worktree) {
+  if (agentDefs?.worktree || options?.worktree) {
     try {
       worktreePath = createWorktree(targetCwdForSession, params.name || params.agent || "subagent");
       effectiveCwdForLaunch = worktreePath;
@@ -1677,7 +1678,7 @@ async function watchSubagent(
       if (!summary) {
         try {
           summary = readScreen(surface, 200)
-            .replace(/__SUBAGENT_DONE_\d+__/, "")
+            .replace(/__SUBAGENT_DONE_\d+__/g, "")
             .trimEnd();
         } catch {
           // The pane is gone (closed by hand, or reaped with its tab). Fall
@@ -1701,10 +1702,10 @@ async function watchSubagent(
 
       finishHerdrAgentState(running);
       closeSurface(surface);
-      if (running.worktreePath) removeWorktree(running.worktreePath);
+      const worktree = running.worktreePath ? finishWorktree(running.worktreePath) : null;
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(running.worktreePath ? { worktreePath: running.worktreePath } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(worktree ? { worktreeBranch: worktree.branch } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1744,7 +1745,7 @@ async function watchSubagent(
 
     finishHerdrAgentState(running);
     closeSurface(surface);
-    if (running.worktreePath) removeWorktree(running.worktreePath);
+    const worktree = running.worktreePath ? finishWorktree(running.worktreePath) : null;
     runningSubagents.delete(running.id);
 
     return {
@@ -1759,14 +1760,14 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
       ...(structuredOutput !== undefined ? { structuredOutput } : {}),
       ...(structuredOutputError ? { structuredOutputError } : {}),
-      ...(running.worktreePath ? { worktreePath: running.worktreePath } : {}),
+      ...(worktree ? { worktreeBranch: worktree.branch } : {}),
     };
   } catch (err: any) {
     try {
       finishHerdrAgentState(running);
       closeSurface(surface);
     } catch {}
-    if (running.worktreePath) removeWorktree(running.worktreePath);
+    if (running.worktreePath) finishWorktree(running.worktreePath);
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -2007,7 +2008,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.stats ? { stats: result.stats } : {}),
                   ...(result.structuredOutput !== undefined ? { structuredOutput: result.structuredOutput } : {}),
                   ...(result.structuredOutputError ? { structuredOutputError: result.structuredOutputError } : {}),
-                  ...(result.worktreePath ? { worktreePath: result.worktreePath } : {}),
+                  ...(result.worktreeBranch ? { worktreeBranch: result.worktreeBranch } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2316,7 +2317,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumedPlacement = loadout.agent
           ? loadAgentDefaults(loadout.agent)?.panePlacement
           : undefined;
-        const surface = createSurface(name, resumedPlacement, loadout.cwd ?? undefined);
+        // The recorded cwd can be gone — a worktree subagent's checkout is
+        // removed on completion (its work lives on the branch). Fall back to
+        // the parent's cwd rather than failing the split on a dead path.
+        const resumeCwd = loadout.cwd && existsSync(loadout.cwd) ? loadout.cwd : undefined;
+        const surface = createSurface(name, resumedPlacement, resumeCwd);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
@@ -2582,16 +2587,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           reservedNames.add(uniqueName);
 
           try {
-            // Apply worktree override: if the caller set worktree:true, inject
-            // it into the agent defs for this spawn.
-            const agentDefs = loadAgentDefaults(t.agent);
-            const effectiveAgentDefs = params.worktree
-              ? { ...agentDefs, worktree: true }
-              : agentDefs;
-
+            // `worktree: true` on the batch overrides each agent's own setting.
             const running = await launchSubagent(
               { agent: t.agent, task: t.task, name: uniqueName, model: t.model, cwd: t.cwd },
               ctx,
+              { worktree: params.worktree },
             );
 
             registerName(parentArtifactDir, running.name, {

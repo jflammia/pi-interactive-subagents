@@ -9,8 +9,9 @@
  *   1. `createWorktree(cwd, name)` — runs `git worktree add` on a new branch
  *      derived from the current HEAD, returns the worktree path.
  *   2. The subagent is launched with `--cwd <worktree-path>`.
- *   3. `removeWorktree(path)` — runs `git worktree remove --force` + deletes
- *      the branch. Called on subagent completion (or failure).
+ *   3. `finishWorktree(path)` — commits whatever the subagent left behind,
+ *      then removes the worktree directory but KEEPS the branch, so the work
+ *      is recoverable. Called on subagent completion (or failure).
  *
  * All git operations are synchronous (execFileSync) because they happen in the
  * spawn/cleanup paths, which are already synchronous-friendly. Failures are
@@ -61,40 +62,55 @@ export function createWorktree(repoCwd: string, name: string): string {
 }
 
 /**
- * Remove a worktree and its branch. Safe to call on an already-removed path
- * (returns silently). Uses `--force` because the subagent may have left
- * untracked files (build artifacts, node_modules, etc.).
+ * Finish a worktree: commit whatever the subagent left behind, drop the
+ * worktree directory, and KEEP the branch.
  *
- * The branch is deleted with `-D` (force) because the work has already been
- * merged or handed off by the time cleanup runs — keeping the branch would
- * just accumulate.
+ * This used to `git worktree remove --force` + `git branch -D`, which deleted
+ * every uncommitted edit the subagent had just made — worktree isolation
+ * advertised "edit-safe" and then threw the edits away. Committing first means
+ * the work survives on `pi-subagent/<name>-<id>`, which the parent can diff,
+ * cherry-pick or merge.
+ *
+ * Safe to call on an already-removed or stale path (returns null).
+ *
+ * ponytail: keeps every subagent branch, including ones with no commits
+ * (a branch ref is ~41 bytes). Add base-comparison work detection if
+ * `git branch --list 'pi-subagent/*'` ever gets noisy.
  */
-export function removeWorktree(worktreePath: string): void {
+export function finishWorktree(worktreePath: string): { branch: string; commit?: string } | null {
   try {
-    // `git worktree remove` and `git branch -D` must run from the main repo
-    // or another live worktree — not from inside the worktree being removed.
-    // `git rev-parse --show-toplevel` from inside a worktree returns that
-    // worktree's own path, which is gone after `worktree remove`. So we
-    // resolve the main repo via `git common-dir` first, which always points
-    // to the original repo regardless of which worktree you're in.
+    const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktreePath });
+
+    // `git worktree remove` must run from the main repo, not from inside the
+    // worktree being removed. `--git-common-dir` always points at the original
+    // repo regardless of which worktree you ask from.
     const commonDir = git(["rev-parse", "--git-common-dir"], { cwd: worktreePath });
     const repoRoot = commonDir.replace(/\/\.git$/, "");
 
-    git(["worktree", "remove", "--force", worktreePath], { cwd: repoRoot });
-
-    // Best-effort branch cleanup. The branch name is derived from the
-    // worktree directory name, so we can reconstruct it.
-    const dirName = basename(worktreePath);
-    const branchName = `pi-subagent/${dirName}`;
-    try {
-      git(["branch", "-D", branchName], { cwd: repoRoot });
-    } catch {
-      // Branch may already be gone or have a different name — not fatal.
+    let commit: string | undefined;
+    if (git(["status", "--porcelain"], { cwd: worktreePath }) !== "") {
+      git(["add", "-A"], { cwd: worktreePath });
+      // No hooks, no signing: this is a machine-local save point in a cleanup
+      // path with no TTY. A signing agent that wants a touch confirmation
+      // would hang here and the work would be lost to `worktree remove`.
+      // Whoever merges or cherry-picks the branch signs their own commit.
+      git(
+        [
+          "-c", "commit.gpgsign=false",
+          "commit", "--no-verify",
+          "-m", `subagent work (${basename(worktreePath)})`,
+        ],
+        { cwd: worktreePath },
+      );
+      commit = git(["rev-parse", "HEAD"], { cwd: worktreePath });
     }
+
+    git(["worktree", "remove", "--force", worktreePath], { cwd: repoRoot });
+    return { branch, ...(commit ? { commit } : {}) };
   } catch {
-    // Worktree already removed, or path is stale. Not fatal — cleanup is
-    // best-effort. A stale worktree entry can be cleaned later with
-    // `git worktree prune`.
+    // Already removed, or path is stale. Cleanup is best-effort; a stale entry
+    // can be cleared later with `git worktree prune`.
+    return null;
   }
 }
 
