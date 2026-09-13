@@ -95,6 +95,26 @@ export function getAvailableBackends(): string[] {
 }
 
 /**
+ * Whether pi can actually reach the model these tests drive.
+ *
+ * Without credentials pi still launches and renders its banner, then sits
+ * there — so every test that waits for a sub-agent to do something fails on a
+ * multi-minute timeout with no hint of the cause. One cheap probe up front
+ * turns 15 minutes of misleading red into an honest skip.
+ */
+export function isTestModelReady(model: string = TEST_MODEL): { ready: boolean; detail: string } {
+  try {
+    const out = execFileSync("pi", ["auth", "check", "--model", model], {
+      encoding: "utf8",
+      timeout: 30_000,
+    }).trim();
+    return { ready: out === "ready", detail: out || "(no output)" };
+  } catch (err: any) {
+    return { ready: false, detail: (err?.stderr || err?.message || String(err)).trim() };
+  }
+}
+
+/**
  * The pane herdr currently has focused, or null.
  *
  * herdr's CLI can only focus a *neighbor* by direction (`pane focus

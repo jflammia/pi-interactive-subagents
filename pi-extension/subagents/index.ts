@@ -1293,6 +1293,63 @@ function startStatusRefresh(pi: ExtensionAPI) {
 // steer message (fire-and-forget). An interactive resume would park the pane
 // waiting for the user, contradicting that result-delivery model.
 /**
+ * The first reason a batch cannot be spawned, or null when every task is fine.
+ *
+ * Checked up front because the launch loop has no catch: a throw partway
+ * through leaves the sub-agents it already started running and unreferenced,
+ * with their keys never reported back to the orchestrator. Anything that would
+ * throw inside launchSubagent has to be caught here first.
+ */
+function findBatchSpawnProblem(
+  tasks: Array<{ agent: string }>,
+  loadDefs: (agent: string) => AgentDefaults | null = loadAgentDefaults,
+): string | null {
+  for (const task of tasks) {
+    const defs = loadDefs(task.agent);
+    if (defs?.toolsMisparsed) {
+      return (
+        `Agent "${task.agent}" writes \`tools:\` as a YAML block list, which this ` +
+        `extension's frontmatter reader cannot parse — the restriction would be ` +
+        `silently dropped. Write it on one line: \`tools: read, bash\`.`
+      );
+    }
+    try {
+      assertCliToolsCompatible(task.agent, defs?.cli, defs?.tools);
+    } catch (err: any) {
+      return err?.message ?? String(err);
+    }
+    if (defs?.cli && defs.cli !== "pi") {
+      try {
+        cliLaunchWords(defs.cli, "");
+      } catch (err: any) {
+        return `Agent "${task.agent}": ${err?.message ?? String(err)}`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The command words that start an external CLI runner.
+ *
+ * codex and cursor were once listed here and could never run: `codex exec` has
+ * no --system-prompt and `cursor-agent` has no --append-system-prompt, yet one
+ * of those was passed for every agent with a body, so both died at argument
+ * parsing. Neither had result extraction or a status source either. A runner
+ * that cannot start is worse than no runner, so the supported set is exactly
+ * one — and this throws for anything else rather than building a command that
+ * will fail in a pane nobody is watching.
+ */
+function cliLaunchWords(cliName: string, pluginDir: string): string[] {
+  if (cliName !== "claude") {
+    throw new Error(`Unknown CLI runner: ${cliName}. Supported: claude.`);
+  }
+  const words = ["claude", "--dangerously-skip-permissions"];
+  if (existsSync(pluginDir)) words.push("--plugin-dir", shellEscape(pluginDir));
+  return words;
+}
+
+/**
  * Refuse an agent that declares BOTH an external `cli:` runner and a `tools:`
  * allowlist.
  *
@@ -1359,10 +1416,20 @@ function registryEntryFor(running: {
  * A `fork` seed copies the parent's assistant messages into the child's
  * session file, so scanning from 0 can return the orchestrator's own words as
  * the sub-agent's answer.
+ *
+ * Takes the whole record rather than a session path and a line count on
+ * purpose: a caller that passes the two separately can pass the wrong baseline
+ * (a literal 0 restores the bug), and that call site is unreachable from a
+ * unit test. With no seam there is nothing for a caller to get wrong.
  */
-function childFinalMessage(sessionFile: string, seededLines: number): string | null {
-  if (!existsSync(sessionFile)) return null;
-  return findLastAssistantMessage(getNewEntries(sessionFile, seededLines)) ?? null;
+function childFinalMessage(running: {
+  sessionFile: string;
+  seededLines?: number;
+}): string | null {
+  if (!existsSync(running.sessionFile)) return null;
+  return (
+    findLastAssistantMessage(getNewEntries(running.sessionFile, running.seededLines ?? 0)) ?? null
+  );
 }
 
 function resumeBlockedByLiveRun(
@@ -1397,12 +1464,16 @@ export const __test__ = {
   startWidgetRefresh,
   resumeBlockedByLiveRun,
   launchSubagent,
+  watchSubagent,
   parseAgentDefinition,
   parseOptionalBoolean,
   resolvePiSummary,
   structuredFields,
   registryEntryFor,
   childFinalMessage,
+  claudeFinalMessage,
+  cliLaunchWords,
+  findBatchSpawnProblem,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1599,24 +1670,7 @@ async function launchSubagentInner(
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-
-    switch (cliName) {
-      case "claude":
-        cmdParts.push("claude");
-        cmdParts.push("--dangerously-skip-permissions");
-        if (existsSync(pluginDir)) {
-          cmdParts.push("--plugin-dir", shellEscape(pluginDir));
-        }
-        break;
-      default:
-        // codex and cursor were listed here but could never run: `codex exec`
-        // has no --system-prompt and `cursor-agent` has no
-        // --append-system-prompt, yet one of those was passed for every agent
-        // with a body, so both died at argument parsing. Neither had result
-        // extraction or a status source either. Advertising a runner that
-        // cannot start is worse than not offering it.
-        throw new Error(`Unknown CLI runner: ${cliName}. Supported: claude.`);
-    }
+    cmdParts.push(...cliLaunchWords(cliName, pluginDir));
 
     if (effectiveModel) {
       cmdParts.push("--model", shellEscape(effectiveModel));
@@ -1915,6 +1969,23 @@ function resolvePiSummary(
   };
 }
 
+/**
+ * A `cli: claude` child's own final message, or null when it produced none.
+ *
+ * Only the Stop hook's sentinel file carries it. Takes the running record
+ * rather than a path so there is no separate "is this really a final message"
+ * flag for a caller to compute wrongly — the null IS the flag.
+ */
+function claudeFinalMessage(running: { sentinelFile?: string }): string | null {
+  if (!running.sentinelFile) return null;
+  try {
+    const text = readFileSync(running.sentinelFile, "utf-8").trim();
+    return text === "" ? null : text;
+  } catch {
+    return null;
+  }
+}
+
 function structuredFields(
   summary: string,
   schema: unknown,
@@ -1973,19 +2044,13 @@ async function watchSubagent(
 
     if (running.cli === "claude") {
       // Claude Code result extraction
-      let summary = "";
-      // Only a summary read from the sentinel file is the agent's actual final
-      // message. The fallbacks below are a 200-line screen scrape and a canned
-      // exit string — validating those would either warn on every run or pick
-      // a stray `{...}` out of terminal noise and report it as valid output.
-      let summaryIsFinalMessage = false;
-
-      if (running.sentinelFile) {
-        try {
-          summary = readFileSync(running.sentinelFile, "utf-8").trim();
-          summaryIsFinalMessage = summary !== "";
-        } catch {}
-      }
+      const claudeFinal = claudeFinalMessage(running);
+      let summary = claudeFinal ?? "";
+      // Only the sentinel file holds the agent's actual final message. The
+      // fallbacks below are a 200-line screen scrape and a canned exit string —
+      // validating those would either warn on every run or pick a stray `{...}`
+      // out of terminal noise and report it as valid output.
+      const summaryIsFinalMessage = claudeFinal !== null;
 
       if (!summary) {
         try {
@@ -2031,7 +2096,7 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     const { summary, isFinalMessage: summaryIsFinalMessage } = resolvePiSummary(
-      childFinalMessage(sessionFile, running.seededLines ?? 0),
+      childFinalMessage(running),
       result,
     );
 
@@ -2876,29 +2941,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        // Same fail-closed check as the single spawn, but up front: the launch
-        // loop below has no catch, so a throw mid-batch would orphan the
-        // subagents already launched.
-        for (const t of params.tasks) {
-          const defs = loadAgentDefaults(t.agent);
-          try {
-            assertCliToolsCompatible(t.agent, defs?.cli, defs?.tools);
-          } catch (err: any) {
-            return {
-              content: [{ type: "text" as const, text: err?.message ?? String(err) }],
-              details: { error: `cli/tools conflict: ${t.agent}` },
-            };
-          }
-          // Same reason: an unknown `cli:` throws deep inside the launch, and
-          // the loop below has no catch — so the batch would abort with its
-          // earlier subagents already live and unreferenced.
-          if (defs?.cli && defs.cli !== "pi" && defs.cli !== "claude") {
-            const err = `Agent "${t.agent}" declares an unknown CLI runner "${defs.cli}". Supported: claude.`;
-            return {
-              content: [{ type: "text" as const, text: err }],
-              details: { error: err },
-            };
-          }
+        const batchProblem = findBatchSpawnProblem(params.tasks);
+        if (batchProblem) {
+          return {
+            content: [{ type: "text" as const, text: batchProblem }],
+            details: { error: batchProblem },
+          };
         }
 
         // Check for duplicate keys.

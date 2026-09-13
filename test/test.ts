@@ -6,6 +6,8 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  cpSync,
+  symlinkSync,
   mkdirSync,
   rmSync,
   existsSync,
@@ -13,7 +15,7 @@ import {
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -59,7 +61,7 @@ import {
   formatStatusLine,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
+  __statusConfigTest__,
   resolveStatusConfig,
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
@@ -740,7 +742,7 @@ describe("status.ts", () => {
 
   it("loads a valid config file", () => {
     const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadStatusConfig(examplePath);
+    const config = __statusConfigTest__.loadStatusConfig(examplePath);
 
     assert.deepEqual(config, {
       enabled: true,
@@ -756,7 +758,7 @@ describe("status.ts", () => {
         JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
       );
 
-      const config = loadStatusConfig(join(dir, "config.json"), examplePath);
+      const config = __statusConfigTest__.loadStatusConfig(join(dir, "config.json"), examplePath);
 
       assert.deepEqual(config, {
         enabled: true,
@@ -779,7 +781,7 @@ describe("status.ts", () => {
   it("reports when neither local nor shared config exists", () => {
     withTempDir((dir) => {
       assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
+        () => __statusConfigTest__.loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
         /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
       );
     });
@@ -791,7 +793,7 @@ describe("status.ts", () => {
       writeFileSync(examplePath, "{\n");
 
       assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), examplePath),
+        () => __statusConfigTest__.loadStatusConfig(join(dir, "config.json"), examplePath),
         /Invalid JSON in subagent config .*config\.json\.example/,
       );
     });
@@ -808,7 +810,7 @@ describe("status.ts", () => {
       );
 
       assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
+        () => __statusConfigTest__.loadStatusConfig(configPath, examplePath),
         /Invalid JSON in subagent config .*config\.json/,
       );
     });
@@ -3481,6 +3483,70 @@ describe("the Claude Stop hook signals completion on every turn boundary", () =>
     });
   });
 
+  it("never leaves the sentinel visible before the transcript pointer", async () => {
+    // Comparing final mtimes is not enough: a hook that creates the sentinel
+    // early and rewrites it later still ends with the right order on disk,
+    // while the parent — which polls and acts on the sentinel's EXISTENCE —
+    // sees completion with no pointer and loses the session copy.
+    const dir = mkdtempSync(join(tmpdir(), "hookorder-"));
+    try {
+      const sentinel = join(dir, "sentinel");
+      const transcript = join(dir, "transcript.jsonl");
+      writeFileSync(transcript, "{}\n");
+
+      let sawSentinelWithoutPointer = false;
+      const watcher = setInterval(() => {
+        if (existsSync(sentinel) && !existsSync(`${sentinel}.transcript`)) {
+          sawSentinelWithoutPointer = true;
+        }
+      }, 1);
+
+      const child = spawn("bash", [HOOK], {
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel },
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      child.stdin.end(
+        JSON.stringify({
+          stop_hook_active: false,
+          transcript_path: transcript,
+          last_assistant_message: "FINAL ANSWER",
+        }),
+      );
+      await new Promise((resolve) => child.on("close", resolve));
+      // Keep watching briefly in case the pointer lags the sentinel.
+      await new Promise((r) => setTimeout(r, 50));
+      clearInterval(watcher);
+
+      assert.equal(
+        sawSentinelWithoutPointer,
+        false,
+        "the parent must never observe completion before the pointer it needs",
+      );
+      assert.equal(existsSync(`${sentinel}.transcript`), true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("swaps the sentinel into place instead of truncating it", () => {
+    // The parent treats the sentinel's EXISTENCE as completion, so a plain `>`
+    // truncate exposes a complete signal carrying an empty result.
+    withTempDir((dir) => {
+      const sentinel = join(dir, "sentinel");
+      writeFileSync(sentinel, "stale content");
+      const inodeBefore = statSync(sentinel).ino;
+
+      runHook({ stop_hook_active: false, last_assistant_message: "FRESH ANSWER" }, sentinel);
+
+      assert.notEqual(
+        statSync(sentinel).ino,
+        inodeBefore,
+        "the sentinel must be renamed into place, not written through",
+      );
+      assert.equal(readFileSync(sentinel, "utf-8").trim(), "FRESH ANSWER");
+    });
+  });
+
   it("leaves no temp files behind", () => {
     withTempDir((dir) => {
       const sentinel = join(dir, "sentinel");
@@ -3506,12 +3572,18 @@ describe("the Claude Stop hook signals completion on every turn boundary", () =>
 describe("resume refuses a run that outlived its parent", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  // The herdr session is passed explicitly throughout: it defaults to
+  // process.env.HERDR_SESSION, and a test that leans on that default asserts
+  // something different depending on where it runs.
+  const SESSION = "probe-session";
+  const entry = { surface: "w1:p2", herdrSession: SESSION };
+
   it("blocks only when the recorded pane is actually busy", () => {
     // The in-memory guard sees only subagents THIS process launched, and that
     // map is empty after a restart — so resume-by-name could start a second
     // pi on a .jsonl a live orphan was still appending to.
     assert.equal(
-      testApi.resumeBlockedByLiveRun({ surface: "w1:p2" }, () => true),
+      testApi.resumeBlockedByLiveRun(entry, () => true, SESSION),
       true,
       "a busy pane must block the resume",
     );
@@ -3523,7 +3595,7 @@ describe("resume refuses a run that outlived its parent", () => {
     // pane therefore exists forever, so an existence check would permanently
     // refuse the resume-by-name that orphans exist to use.
     assert.equal(
-      testApi.resumeBlockedByLiveRun({ surface: "w1:p2" }, () => false),
+      testApi.resumeBlockedByLiveRun(entry, () => false, SESSION),
       false,
       "an idle pane must not block the resume",
     );
@@ -3531,7 +3603,7 @@ describe("resume refuses a run that outlived its parent", () => {
 
   it("never blocks an entry written before panes were recorded", () => {
     assert.equal(
-      testApi.resumeBlockedByLiveRun({}, () => true),
+      testApi.resumeBlockedByLiveRun({}, () => true, SESSION),
       false,
       "registries without a surface must stay resumable",
     );
@@ -3877,9 +3949,340 @@ describe("a fork child's result is its own, not the parent's", () => {
 
       // And that is what the extractor actually uses.
       const testApi = (subagentsModule as any).__test__;
-      assert.equal(testApi.childFinalMessage(child, seeded), null);
-      assert.match(testApi.childFinalMessage(child, 0) ?? "", /PARENT SAID THIS/);
-      assert.equal(testApi.childFinalMessage(join(dir, "nope.jsonl"), 0), null);
+      // And that is what the extractor actually uses. It takes the running
+      // record itself, so there is no baseline argument a caller can pass
+      // wrongly — the seam that would otherwise be untestable.
+      assert.equal(
+        testApi.childFinalMessage({ sessionFile: child, seededLines: seeded }),
+        null,
+        "a fork child that said nothing must report nothing",
+      );
+      assert.match(
+        testApi.childFinalMessage({ sessionFile: child }) ?? "",
+        /PARENT SAID THIS/,
+        "without the baseline it would return the parent's words — the bug",
+      );
+      assert.equal(testApi.childFinalMessage({ sessionFile: join(dir, "nope.jsonl") }), null);
     });
+  });
+});
+
+describe("pollForExit is bounded and reports a vanished pane", () => {
+  it("gives up watching after maxMs and says so without claiming the agent stopped", async () => {
+    // A timeout that fell through to the normal completion path would close a
+    // live agent's pane and finish its worktree.
+    const dir = mkdtempSync(join(tmpdir(), "polltimeout-"));
+    try {
+      // maxMs well under 2*interval, so the deadline is reached before the
+      // pane-gone path can conclude anything — this must hold whether or not
+      // a herdr is reachable to report the probe pane missing.
+      const result = await pollForExit("w99:p99", new AbortController().signal, {
+        interval: 200,
+        doneId: "timeoutprobe",
+        sessionFile: join(dir, "never-written.jsonl"),
+        maxMs: 10,
+      });
+      assert.equal(result.reason, "timeout", "an unbounded watch is the defect");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage ?? "", /still running/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not call a vanished pane dead until a full sidecar pass has run", async () => {
+    // Pane-gone is also a NORMAL end state: a clean run can print its
+    // sentinel, exit, and lose its pane before the watch re-arms. Reporting it
+    // immediately would call that a crash.
+    const dir = mkdtempSync(join(tmpdir(), "pollgone-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      let ticks = 0;
+      const result = await pollForExit("w99:p99", new AbortController().signal, {
+        interval: 200,
+        doneId: "goneprobe",
+        sessionFile,
+        maxMs: 10_000,
+        onTick() {
+          // The subagent's result lands after herdr has already reported the
+          // pane missing. The sidecar is checked before the pane-gone
+          // conclusion, and 2*interval has not elapsed, so "done" must win.
+          ticks++;
+          writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        },
+      });
+      assert.equal(result.reason, "done", "a result that arrives after the pane vanished still counts");
+      assert.equal(result.exitCode, 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("tells a gone pane apart from a herdr hiccup", () => {
+    // A gone pane is terminal for that watch: re-arming forks a `herdr`
+    // process every second for the rest of the session. Anything else is
+    // worth retrying, so the two must not be conflated in either direction.
+    const gone = __herdrApiTest__.isPaneGoneError;
+    assert.equal(gone('{"error":{"code":"pane_not_found"}}', null), true);
+    assert.equal(gone("", new Error("pane w9:p99 not found")), true);
+    assert.equal(gone("", new Error("herdr socket timed out")), false);
+    assert.equal(gone("", new Error("connection refused")), false);
+    assert.equal(gone("", null), false, "a clean no-match must re-arm, not give up");
+  });
+});
+
+describe("gaps the mutation sweep exposed", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("catches every spawn-blocking problem in a batch before launching any of it", () => {
+    // The launch loop has no catch, so a throw partway through leaves the
+    // sub-agents already started running and unreferenced.
+    const defs: Record<string, any> = {
+      good: { name: "good" },
+      blocky: { name: "blocky", toolsMisparsed: true },
+      conflicted: { name: "conflicted", cli: "claude", tools: "read" },
+      deadcli: { name: "deadcli", cli: "codex" },
+      claudeok: { name: "claudeok", cli: "claude" },
+    };
+    const load = (a: string) => defs[a] ?? null;
+
+    assert.equal(testApi.findBatchSpawnProblem([{ agent: "good" }], load), null);
+    assert.equal(testApi.findBatchSpawnProblem([{ agent: "claudeok" }], load), null);
+    assert.equal(testApi.findBatchSpawnProblem([], load), null);
+
+    assert.match(
+      testApi.findBatchSpawnProblem([{ agent: "good" }, { agent: "blocky" }], load) ?? "",
+      /YAML block list/,
+    );
+    assert.match(
+      testApi.findBatchSpawnProblem([{ agent: "conflicted" }], load) ?? "",
+      /Refusing the spawn/,
+    );
+    assert.match(
+      testApi.findBatchSpawnProblem([{ agent: "deadcli" }], load) ?? "",
+      /Unknown CLI runner/,
+    );
+    // An unknown agent is handled by the caller's own allowlist check.
+    assert.equal(testApi.findBatchSpawnProblem([{ agent: "nosuch" }], load), null);
+  });
+
+  it("refuses any external runner combined with tools:, not just claude", () => {
+    // A guard written as `cli !== "claude"` would wave through an unknown
+    // runner, which is the case most likely to be mis-declared.
+    for (const cli of ["claude", "codex", "cursor", "grok", "anything"]) {
+      assert.throws(
+        () => testApi.assertCliToolsCompatible("worker", cli, "read,bash"),
+        /Refusing the spawn/,
+        `cli: ${cli} with a tools: allowlist must be refused`,
+      );
+    }
+  });
+
+  it("supports exactly one external runner and refuses the rest by name", () => {
+    const words = testApi.cliLaunchWords("claude", "/nonexistent/plugin/dir");
+    assert.deepEqual(words, ["claude", "--dangerously-skip-permissions"]);
+
+    // With the plugin dir present it must be passed — that directory holds the
+    // Stop hook, which is the child's only completion signal.
+    withTempDir((pluginDir) => {
+      const withPlugin = testApi.cliLaunchWords("claude", pluginDir);
+      assert.deepEqual(withPlugin.slice(0, 2), ["claude", "--dangerously-skip-permissions"]);
+      assert.equal(withPlugin[2], "--plugin-dir");
+      assert.match(withPlugin[3], new RegExp(pluginDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    });
+
+    for (const dead of ["codex", "cursor", "grok", ""]) {
+      assert.throws(
+        () => testApi.cliLaunchWords(dead, "/nonexistent/plugin/dir"),
+        /Unknown CLI runner/,
+        `${dead || "(empty)"} must not build a launch command`,
+      );
+    }
+  });
+
+  it("treats a shapeless process-info reply as not busy", () => {
+    // paneBusy gates a refusal, so anything it cannot interpret must fail open.
+    for (const shapeless of [
+      { foreground_process_group_id: "123", shell_pid: 123 },
+      { foreground_process_group_id: 123 },
+      { shell_pid: 123 },
+      { foreground_process_group_id: null, shell_pid: undefined },
+      {},
+      null,
+      undefined,
+    ]) {
+      assert.equal(
+        __herdrApiTest__.isBusyProcessInfo(shapeless),
+        false,
+        `must fail open for ${JSON.stringify(shapeless)}`,
+      );
+    }
+    // And still detects the real thing.
+    assert.equal(
+      __herdrApiTest__.isBusyProcessInfo({ foreground_process_group_id: 2, shell_pid: 1 }),
+      true,
+    );
+  });
+
+  it("reads a claude final message only from the sentinel, and says null otherwise", () => {
+    withTempDir((dir) => {
+      const sentinel = join(dir, "sentinel");
+
+      assert.equal(testApi.claudeFinalMessage({}), null, "no sentinel path at all");
+      assert.equal(
+        testApi.claudeFinalMessage({ sentinelFile: sentinel }),
+        null,
+        "sentinel not written yet",
+      );
+
+      writeFileSync(sentinel, "   \n  ");
+      assert.equal(
+        testApi.claudeFinalMessage({ sentinelFile: sentinel }),
+        null,
+        "an empty sentinel is not a final message — it must not be schema-validated",
+      );
+
+      writeFileSync(sentinel, "  FINAL ANSWER\n");
+      assert.equal(testApi.claudeFinalMessage({ sentinelFile: sentinel }), "FINAL ANSWER");
+    });
+  });
+
+  it("runs the queued rebalance after the in-flight one finishes", async () => {
+    // Remembering the request is only half of it: if the flag is never
+    // consumed, the layout stays as the interrupted pass left it — uneven,
+    // which is the bug the guard exists to prevent.
+    const { rebalanceSurfaces, rebalanceInFlight, rebalanceRerun, rebalanceTimers } =
+      __herdrApiTest__;
+    const dir = mkdtempSync(join(tmpdir(), "rebalance-"));
+    const sockPath = join(dir, "herdr.sock");
+    const live: any[] = [];
+    // Answers slowly, so a second request lands while the first is on the wire.
+    const server = createServer((sock) => {
+      live.push(sock);
+      setTimeout(() => sock.end(), 250);
+    });
+
+    const savedSock = process.env.HERDR_SOCKET_PATH;
+    const savedPane = process.env.HERDR_PANE_ID;
+    try {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(sockPath, resolve);
+        });
+      } catch {
+        return; // sandbox forbids unix sockets; nothing to assert
+      }
+      process.env.HERDR_SOCKET_PATH = sockPath;
+      process.env.HERDR_PANE_ID = "w1:p1";
+      rebalanceInFlight.clear();
+      rebalanceRerun.clear();
+      rebalanceTimers.clear();
+
+      // Each pass opens a connection, so connection count is how many passes
+      // actually ran — independent of where the timers happen to land.
+      rebalanceSurfaces("split");
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(rebalanceInFlight.has("split"), true, "a pass should be on the wire");
+      assert.equal(live.length, 1, "exactly one pass so far");
+
+      rebalanceSurfaces("split"); // arrives while the first is still waiting
+      await new Promise((r) => setTimeout(r, 1200));
+
+      assert.ok(
+        live.length >= 2,
+        `the request queued mid-pass must actually run afterwards (passes: ${live.length})`,
+      );
+      assert.equal(rebalanceRerun.has("split"), false, "and the flag must be cleared");
+    } finally {
+      if (savedSock === undefined) delete process.env.HERDR_SOCKET_PATH;
+      else process.env.HERDR_SOCKET_PATH = savedSock;
+      if (savedPane === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = savedPane;
+      for (const t of rebalanceTimers.values()) clearTimeout(t as any);
+      rebalanceTimers.clear();
+      rebalanceInFlight.clear();
+      rebalanceRerun.clear();
+      server.close();
+      for (const sock of live) sock.destroy();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs one rebalance pass at a time and remembers a request made during it", async () => {
+    const { rebalanceSurfaces, rebalanceInFlight, rebalanceRerun, rebalanceTimers } =
+      __herdrApiTest__;
+    const saved = process.env.HERDR_SOCKET_PATH;
+    // No socket path → herdrApi rejects immediately, so a pass completes fast
+    // without needing a live herdr.
+    delete process.env.HERDR_SOCKET_PATH;
+    const savedPane = process.env.HERDR_PANE_ID;
+    process.env.HERDR_PANE_ID = "w1:p1";
+    try {
+      rebalanceInFlight.clear();
+      rebalanceRerun.clear();
+
+      // Mark a pass as running, then ask for another.
+      rebalanceInFlight.add("split");
+      rebalanceSurfaces("split");
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(
+        rebalanceRerun.has("split"),
+        true,
+        "a request during a pass must be remembered, not run concurrently",
+      );
+      // And it must not have armed an endless chain of fresh timers.
+      assert.equal(rebalanceTimers.has("split"), false, "no timer may be left armed");
+
+      rebalanceInFlight.clear();
+      rebalanceRerun.clear();
+    } finally {
+      if (saved === undefined) delete process.env.HERDR_SOCKET_PATH;
+      else process.env.HERDR_SOCKET_PATH = saved;
+      if (savedPane === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = savedPane;
+      rebalanceInFlight.clear();
+      rebalanceRerun.clear();
+    }
+  });
+});
+
+describe("a broken status config cannot take the extension down", () => {
+  it("still imports index.ts when the shipped config is malformed", () => {
+    // The config is read at MODULE SCOPE, so a throw there takes every
+    // subagent tool with it. This drives the real import in a copy of the
+    // tree — the only way to exercise that call site, since PACKAGE_ROOT
+    // comes from import.meta.url.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const repoRoot = join(here, "..");
+    const stage = mkdtempSync(join(tmpdir(), "cfgbreak-"));
+    try {
+      cpSync(join(repoRoot, "pi-extension"), join(stage, "pi-extension"), { recursive: true });
+      symlinkSync(join(repoRoot, "node_modules"), join(stage, "node_modules"));
+
+      const subagentsDir = join(stage, "pi-extension", "subagents");
+      // Both candidate paths broken: malformed JSON, and an unsupported key.
+      writeFileSync(join(subagentsDir, "config.json.example"), "{ not json at all ");
+      writeFileSync(join(subagentsDir, "config.json"), '{"status":{"nope":true}}');
+
+      const probe = join(stage, "probe.mjs");
+      writeFileSync(
+        probe,
+        [
+          `const m = await import(${JSON.stringify(join(subagentsDir, "index.ts"))});`,
+          `if (typeof m.default !== "function") throw new Error("extension did not load");`,
+          `console.log("LOADED");`,
+        ].join("\n"),
+      );
+
+      const out = execFileSync("node", [probe], {
+        encoding: "utf8",
+        cwd: stage,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.match(out, /LOADED/, "a cosmetic widget's config must never block the extension");
+    } finally {
+      rmSync(stage, { recursive: true, force: true });
+    }
   });
 });

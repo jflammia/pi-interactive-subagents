@@ -103,6 +103,35 @@ test("finishWorktree removes the directory but keeps the branch", { skip: !hasGi
   }
 });
 
+test("finishWorktree commits even where the user signs every commit", { skip: !hasGit() }, () => {
+  // The cleanup commit runs in a no-TTY path. If it inherited the user's
+  // signing config, a signing agent that wants a touch confirmation would hang
+  // or fail here — and `worktree remove --force` would then destroy the work.
+  const repo = makeRepo();
+  try {
+    // A hostile signing setup: enabled, ssh format, key that cannot work.
+    execFileSync("git", ["config", "commit.gpgsign", "true"], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["config", "gpg.format", "ssh"], { cwd: repo, stdio: "ignore" });
+    execFileSync("git", ["config", "user.signingkey", join(repo, "nonexistent.pub")], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+
+    const wt = createWorktree(repo, "worker-signed");
+    writeFileSync(join(wt, "WORK.md"), "# real output\n");
+
+    const outcome = finishWorktree(wt);
+    assert.ok(outcome?.commit, "the subagent's work must be committed despite signing config");
+    const files = execFileSync("git", ["show", "--name-only", "--format=", outcome!.commit!], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    assert.match(files, /WORK\.md/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("finishWorktree commits work the subagent left uncommitted", { skip: !hasGit() }, () => {
   const repo = makeRepo();
   try {
