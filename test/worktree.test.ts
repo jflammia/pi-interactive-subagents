@@ -58,13 +58,24 @@ test("createWorktree leaves the parent repo's status clean", { skip: !hasGit() }
     }).trim();
     assert.equal(status, "", `parent repo should stay clean, got: ${status}`);
 
-    // The ignore file covers itself, so nothing under .pi/worktrees is ever
-    // reported — including by `npm pack`.
+    // The ignore must live INSIDE the worktree root and cover itself. Writing
+    // it one level up (.pi/.gitignore) also hides the worktree, but silently
+    // over-ignores everything else the tool keeps under .pi/ — so pin the
+    // source file, not just the effect.
     const ignored = execFileSync("git", ["check-ignore", "-v", ".pi/worktrees/.gitignore"], {
       cwd: repo,
       encoding: "utf8",
     });
-    assert.match(ignored, /\.pi\/worktrees\/\.gitignore/);
+    assert.equal(
+      ignored.split(":")[0],
+      ".pi/worktrees/.gitignore",
+      `the rule must come from the worktree root's own .gitignore, got: ${ignored.trim()}`,
+    );
+    // .pi/agents/ (a real, committed location) must NOT be swept up by it.
+    assert.throws(
+      () => execFileSync("git", ["check-ignore", "-q", ".pi/agents/scout.md"], { cwd: repo }),
+      "the ignore must not cover the rest of .pi/",
+    );
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

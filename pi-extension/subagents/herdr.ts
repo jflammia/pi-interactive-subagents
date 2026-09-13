@@ -113,6 +113,13 @@ function herdrApi(method: string, params: unknown): Promise<any> {
     let buf = "";
     sock.setTimeout(5000, () => sock.destroy(new Error("herdr socket timed out")));
     sock.on("error", reject);
+    // A clean FIN with no complete response line settles nothing on its own:
+    // the peer closing destroys the socket, which clears the inactivity timer
+    // above, so without this the promise pends forever and every `await` on it
+    // is stranded. herdr restarting mid-request does exactly this.
+    sock.on("close", () =>
+      reject(new Error("herdr closed the connection before answering")),
+    );
     sock.on("connect", () => sock.write(JSON.stringify({ id: "pi", method, params }) + "\n"));
     sock.on("data", (chunk) => {
       buf += chunk;
@@ -202,6 +209,8 @@ const rebalanceTimers = new Map<SurfacePlacement, ReturnType<typeof setTimeout>>
  */
 /** Placements with a rebalance pass currently on the wire. */
 const rebalanceInFlight = new Set<SurfacePlacement>();
+/** Placements that asked for a rebalance while one was already running. */
+const rebalanceRerun = new Set<SurfacePlacement>();
 
 function rebalanceSurfaces(placement: SurfacePlacement): void {
   const pending = rebalanceTimers.get(placement);
@@ -215,9 +224,14 @@ function rebalanceSurfaces(placement: SurfacePlacement): void {
       // two can overlap on the socket — the later one then computes ratios
       // from a layout the earlier is still rewriting, and the result is
       // uneven. One pass at a time per placement; a request arriving mid-pass
-      // re-arms after it instead of racing it.
+      // is remembered and run once afterwards.
+      //
+      // Recorded as a flag rather than by re-arming another timer: a re-arm
+      // that finds the pass still running arms another one, so a pass that
+      // never finishes would spin a 120ms timer chain for the life of the
+      // process.
       if (rebalanceInFlight.has(placement)) {
-        rebalanceSurfaces(placement);
+        rebalanceRerun.add(placement);
         return;
       }
       rebalanceInFlight.add(placement);
@@ -237,6 +251,7 @@ function rebalanceSurfaces(placement: SurfacePlacement): void {
           // Panes may have closed mid-pass; balancing is best-effort.
         } finally {
           rebalanceInFlight.delete(placement);
+          if (rebalanceRerun.delete(placement)) rebalanceSurfaces(placement);
         }
       })();
     }, 120),
@@ -707,13 +722,24 @@ function readArgs(surface: string, lines: number, source: string): string[] {
  */
 export function paneBusy(surface: string): boolean {
   try {
-    const info = JSON.parse(herdrCli(["pane", "process-info", "--pane", surface]))?.result
-      ?.process_info;
-    if (!info) return false;
-    return info.foreground_process_group_id !== info.shell_pid;
+    return isBusyProcessInfo(
+      JSON.parse(herdrCli(["pane", "process-info", "--pane", surface]))?.result?.process_info,
+    );
   } catch {
     return false;
   }
+}
+
+/**
+ * The predicate itself, split out so it can be tested without a live pane.
+ * A reply missing either field fails open — this gates a refusal.
+ */
+function isBusyProcessInfo(info: any): boolean {
+  if (!info) return false;
+  const foreground = info.foreground_process_group_id;
+  const shell = info.shell_pid;
+  if (typeof foreground !== "number" || typeof shell !== "number") return false;
+  return foreground !== shell;
 }
 
 /**
@@ -853,6 +879,9 @@ function interpretExitSidecar(data: any): PollResult {
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar };
+
+/** Socket-level internals, exposed so the failure modes can be tested. */
+export const __herdrApiTest__ = { herdrApi, isBusyProcessInfo };
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
