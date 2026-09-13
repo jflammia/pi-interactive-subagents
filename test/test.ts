@@ -64,7 +64,11 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
+import {
+  __pollForExitTest__,
+  sentinelEcho,
+  sentinelPattern,
+} from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -2945,5 +2949,40 @@ describe("herdr.ts socketEndpoint", () => {
   it("defaults to the running platform", () => {
     const path = "/tmp/herdr.sock";
     assert.equal(socketEndpoint(path), process.platform === "win32" ? socketEndpoint(path, "win32") : path);
+  });
+});
+
+describe("herdr.ts exit sentinel is run-unique", () => {
+  const id = "a1b2c3d4";
+
+  it("matches its own run's sentinel and captures the exit code", () => {
+    const printed = "__SUBAGENT_DONE_" + id + "_7__";
+    const m = printed.match(new RegExp(sentinelPattern(id)));
+    assert.equal(m?.[1], "7");
+  });
+
+  it("ignores another run's sentinel", () => {
+    const other = "__SUBAGENT_DONE_ffffffff_0__";
+    assert.equal(new RegExp(sentinelPattern(id)).test(other), false);
+  });
+
+  it("ignores the bare legacy literal an agent can print or grep", () => {
+    // This is the live regression: the repo's own source used to carry
+    // `__SUBAGENT_DONE_0__`, so a subagent grepping it terminated itself.
+    for (const bait of [
+      "__SUBAGENT_DONE_0__",
+      "642: * can't split `__SUBAGENT_DONE_0__` across rows",
+      "__SUBAGENT_DONE___",
+    ]) {
+      assert.equal(new RegExp(sentinelPattern(id)).test(bait), false, bait);
+    }
+  });
+
+  it("emits a shell fragment whose expansion its own pattern matches", () => {
+    const echo = sentinelEcho(id);
+    assert.match(echo, /^echo '__SUBAGENT_DONE_a1b2c3d4_'\$\?'__'$/);
+    // What the shell prints for exit code 12, per that fragment.
+    const expanded = "__SUBAGENT_DONE_" + id + "_12__";
+    assert.equal(expanded.match(new RegExp(sentinelPattern(id)))?.[1], "12");
   });
 });

@@ -639,7 +639,7 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  *
  * `recent-unwrapped` joins rows the terminal soft-wrapped, so a narrow pane
- * can't split `__SUBAGENT_DONE_0__` (or a summary line) across rows and defeat
+ * can't split an exit sentinel (or a summary line) across rows and defeat
  * the callers' regexes. It only covers output produced since the pane's last
  * command started, so a pane that has printed nothing yet reads empty —
  * fall back to the raw visible screen there.
@@ -697,8 +697,24 @@ export function closeSurface(surface: string): void {
 
 // ── Exit polling ──
 
-/** The terminal sentinel the launch command prints when the sub-agent exits. */
-const SENTINEL_PATTERN = "__SUBAGENT_DONE_(\\d+)__";
+/**
+ * The exit sentinel is RUN-UNIQUE, not a fixed literal.
+ *
+ * A fixed `__SUBAGENT_DONE_<code>__` is a string any sub-agent can put on its
+ * own screen — `grep -rn SUBAGENT_DONE` over this very repo used to do it — and
+ * herdr matches server-side, so the watcher would report a false exit for a
+ * still-running agent: its pane gets closed and its worktree finished out from
+ * under it. Keying the pattern to the subagent's own id means only the launch
+ * command this watcher started can satisfy it.
+ */
+export function sentinelEcho(id: string): string {
+  return `echo '__SUBAGENT_DONE_${id}_'$?'__'`;
+}
+
+/** Regex source matching one run's sentinel. Capture group 1 is the exit code. */
+export function sentinelPattern(id: string): string {
+  return `__SUBAGENT_DONE_${id}_(\\d+)__`;
+}
 
 /**
  * Watch a pane for the exit sentinel using herdr's own `pane wait-output`,
@@ -709,41 +725,52 @@ const SENTINEL_PATTERN = "__SUBAGENT_DONE_(\\d+)__";
  * at ~6ms per read, so ~31ms/s of CPU with five sub-agents running).
  *
  * Calls `onExit` with the shell's exit code. Re-arms if the wait ends without a
- * match — a pane that has gone away errors immediately, and re-arming lets the
- * watch recover instead of going deaf, while the caller's file checks continue
- * either way.
+ * match — herdr restarting shouldn't make the watch go deaf. A pane that has
+ * gone away errors immediately and would re-arm forever (one `herdr` fork per
+ * second for the rest of the session), so that case calls `onGone` instead and
+ * stops: the caller decides whether the agent really finished.
  */
 function watchForSentinel(
   surface: string,
+  id: string,
   signal: AbortSignal,
   onExit: (exitCode: number) => void,
+  onGone: () => void,
 ): void {
   if (signal.aborted) return;
 
+  const pattern = sentinelPattern(id);
   const child = execFile(
     "herdr",
     [
       "pane", "wait-output", surface,
-      "--regex", SENTINEL_PATTERN,
+      "--regex", pattern,
       "--source", "recent-unwrapped",
       "--lines", "20",
     ],
     { encoding: "utf8" },
-    (error, stdout) => {
+    (error, stdout, stderr) => {
       signal.removeEventListener("abort", kill);
       if (signal.aborted) return;
       // Take the LAST sentinel in the buffer, not the first: a re-armed watch
       // re-reads the same recent-output window, so an earlier run's sentinel
       // in a reused pane would otherwise report a stale exit code.
-      const matches = error ? [] : [...stdout.matchAll(/__SUBAGENT_DONE_(\d+)__/g)];
+      const matches = error ? [] : [...stdout.matchAll(new RegExp(pattern, "g"))];
       const match = matches[matches.length - 1];
       if (match) {
         onExit(parseInt(match[1], 10));
         return;
       }
-      // No match: the pane may be gone or herdr may have restarted. Wait a beat
-      // so a permanently dead pane cannot spin, then look again.
-      const retry = setTimeout(() => watchForSentinel(surface, signal, onExit), 1000);
+      if (/pane_not_found|not found/i.test(String(stderr ?? "") + String(error ?? ""))) {
+        onGone();
+        return;
+      }
+      // No match: herdr may have restarted. Wait a beat so nothing spins, then
+      // look again.
+      const retry = setTimeout(
+        () => watchForSentinel(surface, id, signal, onExit, onGone),
+        1000,
+      );
       signal.addEventListener("abort", () => clearTimeout(retry), { once: true });
     },
   );
@@ -755,8 +782,11 @@ function watchForSentinel(
 }
 
 export interface PollResult {
-  /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
+  /**
+   * How the subagent exited. `timeout` is the one reason that does NOT mean the
+   * child is finished — the caller must leave its pane and worktree alone.
+   */
+  reason: "done" | "sentinel" | "error" | "timeout";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
@@ -795,20 +825,34 @@ export async function pollForExit(
   signal: AbortSignal,
   options: {
     interval: number;
+    /** The subagent's id — keys the run-unique exit sentinel. */
+    doneId: string;
     sessionFile?: string;
     sentinelFile?: string;
+    /** Give up after this long. Default 6h; a subagent is never infinite. */
+    maxMs?: number;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const maxMs = options.maxMs ?? 6 * 60 * 60 * 1000;
 
   // herdr watches the pane for the sentinel; we only poll the sidecar files.
   const watch = new AbortController();
   const stopWatch = AbortSignal.any([signal, watch.signal]);
   let sentinelExitCode: number | null = null;
-  watchForSentinel(surface, stopWatch, (code) => {
-    sentinelExitCode = code;
-  });
+  let paneGoneAt: number | null = null;
+  watchForSentinel(
+    surface,
+    options.doneId,
+    stopWatch,
+    (code) => {
+      sentinelExitCode = code;
+    },
+    () => {
+      paneGoneAt = Date.now();
+    },
+  );
 
   try {
   for (;;) {
@@ -840,6 +884,26 @@ export async function pollForExit(
     // Terminal sentinel, seen by the herdr watch above (crash detection).
     if (sentinelExitCode !== null) {
       return { reason: "sentinel", exitCode: sentinelExitCode };
+    }
+
+    // The pane is gone: the user closed it, or herdr reaped it with its tab.
+    // Not necessarily a crash — a clean run can print its sentinel, exit, and
+    // lose the pane before the watch re-arms — so only conclude this after a
+    // full pass of the sidecar checks above has also come up empty.
+    if (paneGoneAt !== null && Date.now() - paneGoneAt > 2 * options.interval) {
+      return {
+        reason: "error",
+        exitCode: 1,
+        errorMessage: "Subagent pane disappeared before it reported a result.",
+      };
+    }
+
+    if (Date.now() - start > maxMs) {
+      return {
+        reason: "timeout",
+        exitCode: 1,
+        errorMessage: `Subagent still running after ${Math.round(maxMs / 60000)} minutes; giving up watching it.`,
+      };
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

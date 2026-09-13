@@ -31,6 +31,7 @@ import {
   closeSurface,
   createSurface,
   pollForExit,
+  sentinelEcho,
   sleep,
   uniqueId,
   trackTempFile,
@@ -243,11 +244,30 @@ for (const backend of backends) {
       const surface = createTrackedSurface(env, "exit-probe");
       await sleep(1200);
 
-      sendLongCommand(surface, `(exit 7)\nprintf '__SUBAGENT_DONE_%s__\\n' "$?"`);
-      const result = await pollForExit(surface, new AbortController().signal, { interval: 500 });
+      const id = "aa11bb22";
+      sendLongCommand(surface, `(exit 7)\n${sentinelEcho(id)}`);
+      const result = await pollForExit(surface, new AbortController().signal, {
+        interval: 500,
+        doneId: id,
+      });
 
       assert.equal(result.reason, "sentinel");
       assert.equal(result.exitCode, 7);
+    });
+
+    it("ignores another run's sentinel", async () => {
+      // The literal on screen belongs to a different subagent id, so this
+      // watcher must stay deaf to it — an agent that prints, greps or echoes
+      // some other run's marker cannot terminate this one.
+      const surface = createTrackedSurface(env, "foreign-sentinel-probe");
+      await sleep(1200);
+
+      sendLongCommand(surface, `(exit 3)\n${sentinelEcho("ffffffff")}`);
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 2500);
+      await assert.rejects(() =>
+        pollForExit(surface, ctrl.signal, { interval: 300, doneId: "aa11bb22" }),
+      );
     });
 
     it("aborting a wait rejects and stops watching", async () => {
@@ -255,7 +275,9 @@ for (const backend of backends) {
       await sleep(1000);
       const ctrl = new AbortController();
       setTimeout(() => ctrl.abort(), 800);
-      await assert.rejects(() => pollForExit(surface, ctrl.signal, { interval: 300 }));
+      await assert.rejects(() =>
+        pollForExit(surface, ctrl.signal, { interval: 300, doneId: "abort01" }),
+      );
     });
 
     it("opens the pane in the requested cwd", async () => {
