@@ -21,6 +21,8 @@ import {
   sendCommand,
   sendLongCommand,
   pollForExit,
+  sentinelEcho,
+  sentinelPattern,
   closeSurface,
   shellEscape,
   readScreen,
@@ -544,6 +546,17 @@ function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+/**
+ * How long to watch a subagent before giving up. Not a kill: on expiry the
+ * pane and its worktree are left exactly as they are (see watchSubagent), so
+ * the user can still read, steer, or finish the agent by hand.
+ */
+function getSubagentMaxMs(): number {
+  const raw = process.env.PI_SUBAGENT_MAX_MS?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 6 * 60 * 60 * 1000;
 }
 
 function muxUnavailableResult() {
@@ -1364,7 +1377,7 @@ async function launchSubagent(
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── External CLI paths (Claude Code, Codex, Cursor) ──
   // Each CLI gets its own launch command but shares the same sentinel
-  // mechanism: the wrapper prints `__SUBAGENT_DONE_<exitcode>__` on exit.
+  // mechanism: the wrapper prints a run-unique exit sentinel (see sentinelEcho).
   if (agentDefs?.cli && agentDefs.cli !== "pi") {
     const cliName = agentDefs.cli;
     const sentinelFile = `/tmp/pi-subagent-${cliName}-${id}-done`;
@@ -1405,7 +1418,7 @@ async function launchSubagent(
     // Always pass the task as the prompt.
     cmdParts.push(shellEscape(params.task));
 
-    const command = `${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cmdParts.join(" ")}; ${sentinelEcho(id)}`;
     const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
@@ -1542,7 +1555,7 @@ async function launchSubagent(
   // still rides on the command — PI_SUBAGENT_SURFACE is the pane id, which does
   // not exist until the split has already happened.
   const piCommand = envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = `${piCommand}; ${sentinelEcho(id)}`;
   const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
@@ -1655,6 +1668,8 @@ async function watchSubagent(
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
+      doneId: running.id,
+      maxMs: getSubagentMaxMs(),
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
@@ -1664,6 +1679,26 @@ async function watchSubagent(
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
+
+    // A timeout means we stopped WATCHING, not that the subagent stopped. Skip
+    // every cleanup step: closing the pane would kill a live agent and
+    // finishing the worktree would commit a half-done tree. Leave it in
+    // runningSubagents too, so the widget keeps showing it and
+    // subagent_message can still reach it.
+    if (result.reason === "timeout") {
+      finishHerdrAgentState(running);
+      return {
+        name,
+        task,
+        summary:
+          `${result.errorMessage} It is still running in its pane — read it, steer it with ` +
+          `subagent_message, or close the pane when you are done with it.`,
+        sessionFile,
+        exitCode: result.exitCode,
+        elapsed,
+        ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      };
+    }
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -1678,7 +1713,7 @@ async function watchSubagent(
       if (!summary) {
         try {
           summary = readScreen(surface, 200)
-            .replace(/__SUBAGENT_DONE_\d+__/g, "")
+            .replace(new RegExp(sentinelPattern(running.id), "g"), "")
             .trimEnd();
         } catch {
           // The pane is gone (closed by hand, or reaped with its tab). Fall
@@ -2382,7 +2417,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // The pane was opened in the sub-agent's original cwd, so its tools
         // (safe_bash, edits) operate where they did before.
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${resumeEnvPrefix}${parts.join(" ")}; ${sentinelEcho(id)}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
