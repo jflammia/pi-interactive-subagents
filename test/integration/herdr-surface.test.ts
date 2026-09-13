@@ -10,8 +10,11 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { unlinkSync } from "node:fs";
+import { unlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
+import * as subagentsModule from "../../pi-extension/subagents/index.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -278,6 +281,62 @@ for (const backend of backends) {
       await assert.rejects(() =>
         pollForExit(surface, ctrl.signal, { interval: 300, doneId: "abort01" }),
       );
+    });
+
+    /** Every pane id herdr currently has, across tabs. */
+    function paneIds(): string[] {
+      const out = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
+      return (JSON.parse(out)?.result?.panes ?? []).map((p: any) => p.pane_id);
+    }
+
+    it("closes the pane it opened when the spawn fails", async () => {
+      // The `Unknown CLI runner` throw fires ~60 lines after createSurface, so
+      // a bad `cli:` value used to leave an orphan pane with no owner —
+      // nothing tracks it until the subagent reaches runningSubagents.
+      const dir = mkdtempSync(join(tmpdir(), "pi-leak-"));
+      const agentsDir = join(dir, ".pi", "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        join(agentsDir, "bad-cli-agent.md"),
+        ["---", "name: bad-cli-agent", "cli: nope", "---", "", "body", ""].join("\n"),
+      );
+
+      const before = paneIds();
+      const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = join(dir, ".pi");
+      try {
+        await assert.rejects(
+          () =>
+            (subagentsModule as any).__test__.launchSubagent(
+              { agent: "bad-cli-agent", task: "irrelevant", name: "leakprobe" },
+              {
+                cwd: dir,
+                sessionManager: {
+                  getSessionFile: () => join(dir, "parent.jsonl"),
+                  getSessionId: () => "leakprobe-session",
+                  getSessionDir: () => dir,
+                },
+              },
+            ),
+          /Unknown CLI runner/,
+        );
+      } finally {
+        if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+      }
+
+      // Give herdr a moment to reap the closed pane.
+      await sleep(800);
+      const leaked = paneIds().filter((id) => !before.includes(id));
+      // Close anything we leaked before asserting, so a failure doesn't
+      // poison the rest of the run.
+      for (const id of leaked) {
+        try {
+          closeSurface(id);
+        } catch {}
+      }
+      rmSync(dir, { recursive: true, force: true });
+      assert.deepEqual(leaked, [], "a failed spawn must not leave its pane behind");
     });
 
     it("opens the pane in the requested cwd", async () => {

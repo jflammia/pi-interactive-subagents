@@ -187,6 +187,29 @@ export function loadStatusConfig(
   return parseStatusConfig(parsed, sourcePath);
 }
 
+/**
+ * The same config, but fail-open.
+ *
+ * `loadStatusConfig` is read at module scope, so anything it throws — a missing
+ * file, a stray comma, a `pi update` that wiped the package's config.json —
+ * takes the whole extension down at import time and every subagent tool with
+ * it. This entire config is one boolean controlling a cosmetic widget, so a
+ * bad one must degrade to the default, not brick spawning. The strict loader
+ * stays exported and strict for the tests and for anyone who wants the throw.
+ */
+export function resolveStatusConfig(
+  configPath = DEFAULT_STATUS_CONFIG_PATH,
+  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
+): StatusConfig {
+  try {
+    return loadStatusConfig(configPath, examplePath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[subagents] ${detail} — using the default status config.`);
+    return { enabled: true, lineLimit: DEFAULT_STATUS_LINE_LIMIT };
+  }
+}
+
 export function formatElapsedDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   if (totalSeconds < 60) return `${totalSeconds}s`;

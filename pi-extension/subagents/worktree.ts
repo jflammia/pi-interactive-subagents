@@ -19,6 +19,7 @@
  * fall back to a shared cwd (that would defeat the isolation guarantee).
  */
 import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 
 function git(args: string[], opts: { cwd: string }): string {
@@ -33,8 +34,8 @@ function git(args: string[], opts: { cwd: string }): string {
  * Create a worktree at `<repo>/.pi/worktrees/<name>-<short-id>` on a new branch
  * `pi-subagent/<name>-<short-id>` off the current HEAD.
  *
- * The worktree path is inside `.pi/` so it is gitignored by convention and
- * doesn't clutter the repo root. The branch name is prefixed with `pi-subagent/`
+ * The worktree path is inside `.pi/worktrees/`, which this function makes
+ * self-ignoring, so worktrees never show up in the parent repo's status. The branch name is prefixed with `pi-subagent/`
  * so it's easy to identify and clean up later.
  *
  * Returns the absolute path to the new worktree.
@@ -55,6 +56,15 @@ export function createWorktree(repoCwd: string, name: string): string {
   const shortId = Math.random().toString(16).slice(2, 8);
   const branchName = `pi-subagent/${safeName}-${shortId}`;
   const worktreePath = `${repoRoot}/.pi/worktrees/${safeName}-${shortId}`;
+
+  // Make the worktree root self-ignoring. The worktree lands in whatever repo
+  // the subagent targets, so a line in THIS repo's .gitignore would fix only
+  // this repo; a `*` .gitignore inside the directory covers every target — it
+  // matches itself too, so the whole tree stays out of `git status` and out of
+  // `npm pack`. It cannot hide a committed `.pi/agents/`: gitignore never
+  // applies to tracked files.
+  mkdirSync(`${repoRoot}/.pi/worktrees`, { recursive: true });
+  writeFileSync(`${repoRoot}/.pi/worktrees/.gitignore`, "*\n");
 
   git(["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
 

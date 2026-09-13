@@ -44,6 +44,43 @@ test("createWorktree creates a working tree on a new branch", { skip: !hasGit() 
   }
 });
 
+test("createWorktree leaves the parent repo's status clean", { skip: !hasGit() }, () => {
+  // The worktree lands in whatever repo the subagent targets, so this cannot
+  // be fixed by a line in this repo's .gitignore.
+  const repo = makeRepo();
+  try {
+    const wt = createWorktree(repo, "worker-gi");
+    assert.ok(existsSync(wt));
+
+    const status = execFileSync("git", ["status", "--porcelain"], {
+      cwd: repo,
+      encoding: "utf8",
+    }).trim();
+    assert.equal(status, "", `parent repo should stay clean, got: ${status}`);
+
+    // The ignore must live INSIDE the worktree root and cover itself. Writing
+    // it one level up (.pi/.gitignore) also hides the worktree, but silently
+    // over-ignores everything else the tool keeps under .pi/ — so pin the
+    // source file, not just the effect.
+    const ignored = execFileSync("git", ["check-ignore", "-v", ".pi/worktrees/.gitignore"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    assert.equal(
+      ignored.split(":")[0],
+      ".pi/worktrees/.gitignore",
+      `the rule must come from the worktree root's own .gitignore, got: ${ignored.trim()}`,
+    );
+    // .pi/agents/ (a real, committed location) must NOT be swept up by it.
+    assert.throws(
+      () => execFileSync("git", ["check-ignore", "-q", ".pi/agents/scout.md"], { cwd: repo }),
+      "the ignore must not cover the rest of .pi/",
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("finishWorktree removes the directory but keeps the branch", { skip: !hasGit() }, () => {
   const repo = makeRepo();
   try {
