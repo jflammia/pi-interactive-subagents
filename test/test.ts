@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -2512,6 +2512,39 @@ describe("subagent interruption", () => {
     });
   });
 
+  it("tells the orchestrator when a declared output-schema was not met", () => {
+    // `details` never reaches the model — pi forwards only `content` — so a
+    // schema violation used to be invisible to the only reader who could act
+    // on it.
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 0,
+        elapsed: 30,
+        summary: "Looks fine to me.",
+        structuredOutputError: "value: expected object, got string",
+      },
+      "scout",
+    );
+
+    assert.match(presentation, /WARNING: this agent declares an output-schema/);
+    assert.match(presentation, /expected object, got string/);
+    // Before the follow-up hint, which the TUI strips.
+    assert.ok(
+      presentation.indexOf("WARNING:") < presentation.indexOf("Follow up with"),
+      "the warning must precede the follow-up hint or the renderer swallows it",
+    );
+  });
+
+  it("says nothing about schemas when the agent declared none", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      { exitCode: 0, elapsed: 30, summary: "Looks fine to me." },
+      "scout",
+    );
+    assert.doesNotMatch(presentation, /output-schema/);
+  });
+
   it("fences the sub-agent's own words as untrusted", () => {
     // The summary is child-authored. Without a fence it sits flush against
     // the harness's own sentences, so a line the child writes reads to the
@@ -3163,3 +3196,55 @@ describe("pollForExit tick callbacks cannot kill the subagent they observe", () 
 function surfaceThatDoesNotExist(): string {
   return "w99:p99";
 }
+
+describe("cli: runners cannot silently drop a tools: allowlist", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("refuses an agent that declares both cli: and tools:", () => {
+    // The claude runner launches --dangerously-skip-permissions, so the
+    // allowlist was dropped and the child ran with every tool.
+    assert.throws(
+      () => testApi.assertCliToolsCompatible("worker", "claude", "read,bash"),
+      /declares both cli: claude and a tools: allowlist|Refusing the spawn/,
+    );
+  });
+
+  it("allows either one alone, and an explicit cli: pi", () => {
+    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", "claude", undefined));
+    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", undefined, "read,bash"));
+    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", "pi", "read,bash"));
+    // An empty tools: is falsy and means "no restriction" everywhere else too.
+    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", "claude", ""));
+  });
+});
+
+describe("the widget interval does not run in a headless session", () => {
+  const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
+  const testApi = (subagentsModule as any).__test__;
+
+  function currentInterval() {
+    return (globalThis as any)[WIDGET_INTERVAL_KEY] ?? null;
+  }
+
+  beforeEach(() => {
+    const existing = currentInterval();
+    if (existing) clearInterval(existing);
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  });
+
+  it("starts no interval when the session has no UI", () => {
+    // updateWidget's only clearInterval sits behind the UI path, so an
+    // interval started headless ticked once a second forever.
+    const { api } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    testApi.startWidgetRefresh();
+    assert.equal(currentInterval(), null, "headless sessions must not arm the widget timer");
+  });
+
+  afterEach(() => {
+    const existing = currentInterval();
+    if (existing) clearInterval(existing);
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  });
+});

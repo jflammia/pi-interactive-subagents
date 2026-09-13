@@ -32,10 +32,13 @@ Everything below is how sub-agents behave in this extension.
 - **Names are predictable.** A sub-agent's name is normalized once to
   `[a-z][a-z0-9_-]{0,31}` and that one string is the widget row, the pane
   label, the herdr agent label and the generated filenames.
-- **Sub-agents stay sandboxed.** They launch with `--no-extensions` and an
+- **pi sub-agents stay sandboxed.** They launch with `--no-extensions` and an
   explicit tool allowlist, and nothing about the herdr integration widens that
   — state is reported by the parent, so herdr never learns a session it could
   relaunch unsandboxed. See [herdr agent state](#herdr-agent-state).
+  `cli: claude` agents are the exception: they run under Claude Code's own
+  permission model (`--dangerously-skip-permissions`), not pi's allowlist, so
+  declaring both `cli:` and `tools:` is refused rather than silently widened.
 
 Requires [herdr](https://herdr.dev); pi must be running in a herdr pane.
 
@@ -171,7 +174,8 @@ You are a specialized agent that does X...
 | `pane-placement` | string | `split` (default) tiles the pane in pi's tab; `tab` puts it in a dedicated subagent tab, leaving pi's window full-size |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
+| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi (outside pi's tool allowlist — cannot be combined with `tools:`) |
+| `output-schema` | string | JSON Schema the agent's final message must satisfy — inline JSON, or a path to a `.json` file |
 
 ### session-mode
 
@@ -192,9 +196,23 @@ Notes:
 
 Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
 
+### output-schema
+
+A JSON Schema — written inline, or as a path to a `.json` file — that the agent's
+final message must satisfy. The result is parsed out of that message (a fenced
+```json block, or the whole message), validated, and returned as
+`structuredOutput`. A mismatch does not fail the run: the result carries
+`structuredOutputError` and the orchestrator is told in the result text that the
+schema was not met, so it can re-ask rather than act on malformed output.
+
+The schema is **not** injected into the sub-agent's prompt — say what to emit in
+the agent's body as well, or nothing will ask it to produce JSON.
+
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only**. Every **pi** sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+
+`cli: claude` agents are outside this mechanism entirely: Claude Code enforces its own permissions, and a pane has nobody to answer its prompts, so the runner passes `--dangerously-skip-permissions`. An agent declaring both `cli:` and `tools:` is therefore refused at spawn — honoring the `cli:` would silently hand the child every tool.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 

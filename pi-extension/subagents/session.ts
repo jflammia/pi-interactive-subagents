@@ -214,7 +214,7 @@ export interface SubagentLoadout {
   outputSchema: unknown | null;
   /** Whether this subagent runs in an isolated git worktree. */
   worktree: boolean;
-  /** CLI runner: "pi" (default), "claude", "codex", or "cursor". */
+  /** CLI runner: "pi" (default) or "claude". */
   cli: string | null;
 }
 

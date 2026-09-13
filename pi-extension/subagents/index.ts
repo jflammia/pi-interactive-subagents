@@ -610,7 +610,13 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    | "exitCode"
+    | "elapsed"
+    | "summary"
+    | "sessionFile"
+    | "sessionId"
+    | "errorMessage"
+    | "structuredOutputError"
   >,
   name: string,
 ): string {
@@ -632,6 +638,14 @@ function resolveResultPresentation(
     );
   }
 
+  // `details` never reaches the orchestrator model — pi forwards only
+  // `content` — so a schema violation was invisible to the one reader who
+  // could act on it. Put it in the text. Before sessionRef, so the TUI's
+  // follow-up strip does not swallow it.
+  const schemaNote = result.structuredOutputError
+    ? `\n\nWARNING: this agent declares an output-schema and its final message did not match it — ${result.structuredOutputError}`
+    : "";
+
   // The summary is the sub-agent's own words — its final message, or for a
   // `cli:` agent the raw pane scrape. Fence it so the orchestrator can tell
   // harness framing from child-authored text: without this, a line the child
@@ -642,8 +656,8 @@ function resolveResultPresentation(
     `--- END SUBAGENT OUTPUT ---`;
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${body}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${body}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${body}${schemaNote}${sessionRef}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${body}${schemaNote}${sessionRef}`;
 }
 
 /**
@@ -1245,6 +1259,34 @@ function startStatusRefresh(pi: ExtensionAPI) {
 // its follow-up task to completion and the harness delivers the result as a
 // steer message (fire-and-forget). An interactive resume would park the pane
 // waiting for the user, contradicting that result-delivery model.
+/**
+ * Refuse an agent that declares BOTH an external `cli:` runner and a `tools:`
+ * allowlist.
+ *
+ * An external CLI cannot enforce pi's allowlist — the claude runner is
+ * launched with --dangerously-skip-permissions precisely because a pane has
+ * nobody to answer its prompts — so the declared restriction was silently
+ * dropped and the child ran unrestricted. Fail closed instead of widening.
+ *
+ * ponytail: no mapping onto `claude --tools`. pi names don't map 1:1
+ * (safe_bash has no analogue, mapping it to Bash WIDENS the very restriction
+ * it exists to impose; find/ls/web_search/extension tools have none), and a
+ * guess fails silently — which is this defect again, wearing a table.
+ */
+function assertCliToolsCompatible(
+  agentName: string,
+  cli: string | undefined,
+  tools: string | undefined,
+): void {
+  if (!tools || !cli || cli === "pi") return;
+  throw new Error(
+    `Agent "${agentName}" declares both cli: ${cli} and a tools: allowlist. ` +
+      `An external CLI runner cannot enforce pi's tool allowlist, so honoring ` +
+      `the cli: would silently give this sub-agent every tool. Refusing the spawn. ` +
+      `Remove tools: to accept an unrestricted ${cli} child, or remove cli: to keep the allowlist.`,
+  );
+}
+
 function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolean } {
   return { autoExit: true, interactive: false };
 }
@@ -1260,6 +1302,8 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  assertCliToolsCompatible,
+  startWidgetRefresh,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1282,7 +1326,11 @@ export const __test__ = {
 };
 
 function startWidgetRefresh() {
-  if (widgetInterval) return;
+  // No UI means nothing renders the widget, and the interval's only clear
+  // condition is inside updateWidget's UI path — so in a headless session it
+  // ticked once a second for the life of the process. `updateWidget` already
+  // gates on this same predicate.
+  if (widgetInterval || !latestCtx?.hasUI) return;
   updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
     updateWidget();
@@ -1307,6 +1355,8 @@ async function launchSubagent(
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
+  // Before any pane or worktree exists, so a refusal leaks nothing.
+  assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
@@ -1390,7 +1440,7 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── External CLI paths (Claude Code, Codex, Cursor) ──
+  // ── External CLI path (Claude Code) ──
   // Each CLI gets its own launch command but shares the same sentinel
   // mechanism: the wrapper prints a run-unique exit sentinel (see sentinelEcho).
   if (agentDefs?.cli && agentDefs.cli !== "pi") {
@@ -1409,15 +1459,14 @@ async function launchSubagent(
           cmdParts.push("--plugin-dir", shellEscape(pluginDir));
         }
         break;
-      case "codex":
-        cmdParts.push("codex");
-        cmdParts.push("exec");
-        break;
-      case "cursor":
-        cmdParts.push("cursor-agent");
-        break;
       default:
-        throw new Error(`Unknown CLI runner: ${cliName}. Supported: claude, codex, cursor.`);
+        // codex and cursor were listed here but could never run: `codex exec`
+        // has no --system-prompt and `cursor-agent` has no
+        // --append-system-prompt, yet one of those was passed for every agent
+        // with a body, so both died at argument parsing. Neither had result
+        // extraction or a status source either. Advertising a runner that
+        // cannot start is worse than not offering it.
+        throw new Error(`Unknown CLI runner: ${cliName}. Supported: claude.`);
     }
 
     if (effectiveModel) {
@@ -1426,8 +1475,7 @@ async function launchSubagent(
 
     const sp = agentDefs.body;
     if (sp) {
-      const promptFlag = cliName === "codex" ? "--system-prompt" : "--append-system-prompt";
-      cmdParts.push(promptFlag, shellEscape(sp));
+      cmdParts.push("--append-system-prompt", shellEscape(sp));
     }
 
     // Always pass the task as the prompt.
@@ -1459,7 +1507,9 @@ async function launchSubagent(
       sentinelFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
-        source: cliName,
+        // The switch above throws for anything else, so this is provably
+        // "claude" — and SubagentStatusSource has no other external member.
+        source: "claude",
         startTimeMs: startTime,
       }),
       ...(worktreePath ? { worktreePath } : {}),
@@ -1684,6 +1734,24 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Validate a sub-agent's final message against its declared output schema.
+ *
+ * Returns the fields to spread into the result: the parsed value, or the
+ * validation error. Both branches of watchSubagent use this, so a `cli:`
+ * agent can no longer capture a schema and then silently drop it.
+ */
+function structuredFields(
+  summary: string,
+  schema: unknown,
+): { structuredOutput?: unknown; structuredOutputError?: string } {
+  if (!schema || !summary) return {};
+  const extracted = extractStructuredOutput(summary, schema);
+  return extracted.ok
+    ? { structuredOutput: extracted.value }
+    : { structuredOutputError: extracted.error };
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1728,10 +1796,16 @@ async function watchSubagent(
     if (running.cli === "claude") {
       // Claude Code result extraction
       let summary = "";
+      // Only a summary read from the sentinel file is the agent's actual final
+      // message. The fallbacks below are a 200-line screen scrape and a canned
+      // exit string — validating those would either warn on every run or pick
+      // a stray `{...}` out of terminal noise and report it as valid output.
+      let summaryIsFinalMessage = false;
 
       if (running.sentinelFile) {
         try {
           summary = readFileSync(running.sentinelFile, "utf-8").trim();
+          summaryIsFinalMessage = summary !== "";
         } catch {}
       }
 
@@ -1765,7 +1839,16 @@ async function watchSubagent(
       const worktree = running.worktreePath ? finishWorktree(running.worktreePath) : null;
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(worktree ? { worktreeBranch: worktree.branch } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        ...(summaryIsFinalMessage ? structuredFields(summary, running.outputSchema) : {}),
+        exitCode: result.exitCode,
+        elapsed,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+        ...(worktree ? { worktreeBranch: worktree.branch } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1790,18 +1873,6 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    // Structured output validation: if the agent declared an outputSchema,
-    // try to parse and validate the final assistant message as JSON.
-    let structuredOutput: unknown | undefined;
-    let structuredOutputError: string | undefined;
-    if (running.outputSchema && summary) {
-      const result = extractStructuredOutput(summary, running.outputSchema);
-      if (result.ok) {
-        structuredOutput = result.value;
-      } else {
-        structuredOutputError = result.error;
-      }
-    }
 
     finishHerdrAgentState(running);
     closeSurface(surface);
@@ -1818,8 +1889,7 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
-      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
-      ...(structuredOutputError ? { structuredOutputError } : {}),
+      ...structuredFields(summary, running.outputSchema),
       ...(worktree ? { worktreeBranch: worktree.branch } : {}),
     };
   } catch (err: any) {
@@ -2475,6 +2545,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          // The loadout has recorded this since spawn but nothing read it
+          // back, so a resumed agent's schema violations went unreported.
+          ...(loadout.outputSchema ? { outputSchema: loadout.outputSchema } : {}),
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
@@ -2613,6 +2686,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             return {
               content: [{ type: "text" as const, text: `Agent "${t.agent}" is not available. Available: ${permittedAgents.join(", ")}.` }],
               details: { error: `unknown agent: ${t.agent}` },
+            };
+          }
+        }
+
+        // Same fail-closed check as the single spawn, but up front: the launch
+        // loop below has no catch, so a throw mid-batch would orphan the
+        // subagents already launched.
+        for (const t of params.tasks) {
+          const defs = loadAgentDefaults(t.agent);
+          try {
+            assertCliToolsCompatible(t.agent, defs?.cli, defs?.tools);
+          } catch (err: any) {
+            return {
+              content: [{ type: "text" as const, text: err?.message ?? String(err) }],
+              details: { error: `cli/tools conflict: ${t.agent}` },
             };
           }
         }

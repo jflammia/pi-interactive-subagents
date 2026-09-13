@@ -200,6 +200,9 @@ const rebalanceTimers = new Map<SurfacePlacement, ReturnType<typeof setTimeout>>
  * pass, and non-fatal throughout: a cosmetic resize must never break spawning
  * or watching.
  */
+/** Placements with a rebalance pass currently on the wire. */
+const rebalanceInFlight = new Set<SurfacePlacement>();
+
 function rebalanceSurfaces(placement: SurfacePlacement): void {
   const pending = rebalanceTimers.get(placement);
   if (pending) clearTimeout(pending);
@@ -207,6 +210,17 @@ function rebalanceSurfaces(placement: SurfacePlacement): void {
     placement,
     setTimeout(() => {
       rebalanceTimers.delete(placement);
+      // The debounce only coalesces timer-to-timer. Parallel spawns are
+      // serialized by the shell-ready delay, so each pass fires on its own and
+      // two can overlap on the socket — the later one then computes ratios
+      // from a layout the earlier is still rewriting, and the result is
+      // uneven. One pass at a time per placement; a request arriving mid-pass
+      // re-arms after it instead of racing it.
+      if (rebalanceInFlight.has(placement)) {
+        rebalanceSurfaces(placement);
+        return;
+      }
+      rebalanceInFlight.add(placement);
       void (async () => {
         try {
           // Any live pane of the target tab anchors the pass: `layout.export`
@@ -221,6 +235,8 @@ function rebalanceSurfaces(placement: SurfacePlacement): void {
           }
         } catch {
           // Panes may have closed mid-pass; balancing is best-effort.
+        } finally {
+          rebalanceInFlight.delete(placement);
         }
       })();
     }, 120),
