@@ -907,7 +907,15 @@ export async function pollForExit(
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
+    // The tick callbacks observe a LIVE subagent (status snapshot, pending
+    // question). A throw from one — a sendMessage into an invalidated
+    // extension runner, say — would escape the loop and land in
+    // watchSubagent's catch, which closes the pane and finishes the worktree
+    // of an agent that is still working. Observation must never be able to
+    // terminate the thing it observes.
+    try {
+      options.onTick?.(elapsed);
+    } catch {}
 
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));

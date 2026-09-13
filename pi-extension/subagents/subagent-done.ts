@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { writeFileSync } from "node:fs";
+import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -363,17 +363,44 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Keep the session open: suppress auto-exit for this turn and park in the
-      // "waiting" phase. The parent's watcher picks up the `.ask` signal and
-      // notifies the orchestrator, who replies via subagent_message.
-      awaitingAnswer = true;
-      recorder.askQuestion();
+      // One question at a time. The `.ask` path is a single fixed filename read
+      // at ~1Hz, so a second question silently overwrites the first and the
+      // orchestrator never sees it. The tool description already says to ask
+      // once and wait; make breaking that a visible error, not a lost question.
+      if (awaitingAnswer) {
+        throw new Error(
+          "A question is already pending — stop and wait for the orchestrator's reply before asking another.",
+        );
+      }
+
       const askData = {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+
+      // Publish atomically: the parent polls this path, so a partially-written
+      // file is a torn read that destroys the question. Same directory means
+      // same filesystem, so rename(2) is atomic — the parent sees no file or
+      // the whole file, never half of one. (activity.ts writes the same way.)
+      const askFile = `${sessionFile}.ask`;
+      const askTmp = `${askFile}.tmp`;
+      try {
+        writeFileSync(askTmp, JSON.stringify(askData));
+        renameSync(askTmp, askFile);
+      } catch (err) {
+        try {
+          unlinkSync(askTmp);
+        } catch {}
+        throw err;
+      }
+
+      // Only now keep the session open: suppress auto-exit for this turn and
+      // park in the "waiting" phase. Setting this BEFORE the write meant a
+      // failed publish left the child parked forever with no signal at all —
+      // the error must reach the model instead.
+      awaitingAnswer = true;
+      recorder.askQuestion();
 
       return {
         content: [
