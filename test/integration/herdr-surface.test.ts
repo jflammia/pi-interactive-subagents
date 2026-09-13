@@ -283,6 +283,28 @@ for (const backend of backends) {
       );
     });
 
+    /** A minimal ExtensionAPI host, enough to register and drive a tool. */
+    function makeToolHost() {
+      const registeredTools: any[] = [];
+      return {
+        registeredTools,
+        api: {
+          on() {},
+          registerTool(t: any) {
+            registeredTools.push(t);
+          },
+          registerCommand() {},
+          registerMessageRenderer() {},
+          registerShortcut() {},
+          sendUserMessage() {},
+          sendMessage() {},
+          getAllTools() {
+            return [];
+          },
+        } as any,
+      };
+    }
+
     /** Every pane id herdr currently has, across tabs. */
     function paneIds(): string[] {
       const out = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
@@ -337,6 +359,361 @@ for (const backend of backends) {
       }
       rmSync(dir, { recursive: true, force: true });
       assert.deepEqual(leaked, [], "a failed spawn must not leave its pane behind");
+    });
+
+    /** Drive a real launchSubagent against a throwaway project dir. */
+    async function launchWith(frontmatter: string[], name: string) {
+      const dir = mkdtempSync(join(tmpdir(), "pi-guard-"));
+      const agentsDir = join(dir, ".pi", "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        join(agentsDir, `${name}.md`),
+        ["---", `name: ${name}`, ...frontmatter, "---", "", "body", ""].join("\n"),
+      );
+      const prev = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = join(dir, ".pi");
+      try {
+        return await (subagentsModule as any).__test__.launchSubagent(
+          { agent: name, task: "irrelevant", name: `${name}-probe` },
+          {
+            cwd: dir,
+            sessionManager: {
+              getSessionFile: () => join(dir, "parent.jsonl"),
+              getSessionId: () => "guard-session",
+              getSessionDir: () => dir,
+            },
+          },
+        );
+      } finally {
+        if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prev;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    it("refuses cli: + tools: at the real spawn, before opening anything", async () => {
+      // The guard is only useful if launchSubagent actually calls it.
+      const before = paneIds();
+      await assert.rejects(
+        () => launchWith(["cli: claude", "tools: read, bash"], "cli-tools-agent"),
+        /Refusing the spawn/,
+      );
+      await sleep(600);
+      assert.deepEqual(
+        paneIds().filter((id) => !before.includes(id)),
+        [],
+        "a refusal must happen before any pane exists",
+      );
+    });
+
+    it("refuses a YAML block-list tools: at the real spawn", async () => {
+      const before = paneIds();
+      await assert.rejects(
+        () => launchWith(["tools:", "  - read", "  - bash"], "block-tools-agent"),
+        /YAML block list/,
+      );
+      await sleep(600);
+      assert.deepEqual(paneIds().filter((id) => !before.includes(id)), []);
+    });
+
+    it("cleans up the worktree too when a spawn fails after creating one", async () => {
+      // The pane and the worktree are both unowned until the subagent is
+      // registered; a failure between must not strand either.
+      const repo = mkdtempSync(join(tmpdir(), "pi-wt-leak-"));
+      execFileSync("git", ["init", "-q"], { cwd: repo });
+      execFileSync("git", ["config", "user.email", "t@t.com"], { cwd: repo });
+      execFileSync("git", ["config", "user.name", "T"], { cwd: repo });
+      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: repo });
+      writeFileSync(join(repo, "README.md"), "# t\n");
+      execFileSync("git", ["add", "."], { cwd: repo });
+      execFileSync("git", ["commit", "-qm", "init"], { cwd: repo });
+
+      const agentsDir = join(repo, ".pi", "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        join(agentsDir, "wt-bad-cli.md"),
+        ["---", "name: wt-bad-cli", "worktree: true", "cli: nope", "---", "", "body", ""].join("\n"),
+      );
+
+      const prev = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = join(repo, ".pi");
+      try {
+        await assert.rejects(
+          () =>
+            (subagentsModule as any).__test__.launchSubagent(
+              { agent: "wt-bad-cli", task: "irrelevant", name: "wtleak" },
+              {
+                cwd: repo,
+                sessionManager: {
+                  getSessionFile: () => join(repo, "parent.jsonl"),
+                  getSessionId: () => "wtleak-session",
+                  getSessionDir: () => repo,
+                },
+              },
+            ),
+          /Unknown CLI runner/,
+        );
+
+        // The worktree directory must be gone, and its work preserved on a branch.
+        const listed = execFileSync("git", ["worktree", "list", "--porcelain"], {
+          cwd: repo,
+          encoding: "utf8",
+        });
+        assert.equal(
+          listed.includes("/.pi/worktrees/"),
+          false,
+          `a failed spawn must not strand its worktree: ${listed}`,
+        );
+        const branches = execFileSync("git", ["branch", "--list", "pi-subagent/*"], {
+          cwd: repo,
+          encoding: "utf8",
+        }).trim();
+        assert.notEqual(branches, "", "the branch must survive so nothing is lost");
+      } finally {
+        if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prev;
+        rmSync(repo, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses to resume a sub-agent whose pane is still working", async () => {
+      // The in-memory guard only sees children THIS process launched, so a
+      // child that outlived its parent was invisible and resuming it started a
+      // SECOND pi on the same session file. This drives the real tool handler
+      // against a real busy pane.
+      const dir = mkdtempSync(join(tmpdir(), "pi-resume-"));
+      const busy = createTrackedSurface(env, "busy-probe");
+      await sleep(1000);
+      sendCommand(busy, "sleep 45");
+      await sleep(1200);
+
+      try {
+        const sessionPath = join(dir, "orphan.jsonl");
+        writeFileSync(sessionPath, JSON.stringify({ type: "session", id: "orphan-1" }) + "\n");
+        writeFileSync(
+          `${sessionPath}.loadout.json`,
+          JSON.stringify({ agent: "scout", tools: "read", cwd: dir, model: null }),
+        );
+
+        // The registry the resume path reads, with the pane recorded.
+        const artifactDir = join(dir, "artifacts", "resume-session");
+        mkdirSync(artifactDir, { recursive: true });
+        writeFileSync(
+          join(artifactDir, "subagent-registry.json"),
+          JSON.stringify({
+            orphan: {
+              sessionFile: sessionPath,
+              sessionId: "orphan-1",
+              surface: busy,
+              herdrSession: process.env.HERDR_SESSION,
+            },
+          }),
+        );
+
+        const { api, registeredTools } = makeToolHost();
+        (subagentsModule as any).default(api);
+        const tool = registeredTools.find((t: any) => t.name === "subagent_message");
+        assert.ok(tool, "subagent_message must be registered");
+
+        const out = await tool.execute(
+          "call-1",
+          { name: "orphan", message: "status?" },
+          undefined,
+          undefined,
+          {
+            cwd: dir,
+            sessionManager: {
+              getSessionFile: () => join(dir, "parent.jsonl"),
+              getSessionId: () => "resume-session",
+              getSessionDir: () => dir,
+            },
+          },
+        );
+
+        const text = out?.content?.[0]?.text ?? "";
+        assert.match(
+          text,
+          /still running in pane/i,
+          `a busy pane must block the resume, got: ${text}`,
+        );
+      } finally {
+        // Close it here rather than at suite teardown: a pane running `sleep`
+        // shrinks every other pane in the session and makes the screen-read
+        // tests flaky.
+        closeSurface(busy);
+        untrackSurface(env, busy);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("honours a batch-level worktree override on an agent that never asked for one", async () => {
+      // subagents_parallel({ worktree: true }) must isolate every task, even
+      // agents whose own frontmatter says nothing about worktrees. The
+      // override used to be computed and then dropped on the floor.
+      const repo = mkdtempSync(join(tmpdir(), "pi-wt-override-"));
+      execFileSync("git", ["init", "-q"], { cwd: repo });
+      execFileSync("git", ["config", "user.email", "t@t.com"], { cwd: repo });
+      execFileSync("git", ["config", "user.name", "T"], { cwd: repo });
+      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: repo });
+      writeFileSync(join(repo, "README.md"), "# t\n");
+      execFileSync("git", ["add", "."], { cwd: repo });
+      execFileSync("git", ["commit", "-qm", "init"], { cwd: repo });
+
+      const agentsDir = join(repo, ".pi", "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      // No `worktree:` key at all — the override is the only thing that can
+      // cause isolation here. `cli: nope` makes the spawn fail fast.
+      writeFileSync(
+        join(agentsDir, "plain-agent.md"),
+        ["---", "name: plain-agent", "cli: nope", "---", "", "body", ""].join("\n"),
+      );
+
+      const prev = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = join(repo, ".pi");
+      try {
+        await assert.rejects(
+          () =>
+            (subagentsModule as any).__test__.launchSubagent(
+              { agent: "plain-agent", task: "irrelevant", name: "override-probe" },
+              {
+                cwd: repo,
+                sessionManager: {
+                  getSessionFile: () => join(repo, "parent.jsonl"),
+                  getSessionId: () => "override-session",
+                  getSessionDir: () => repo,
+                },
+              },
+              { worktree: true },
+            ),
+          /Unknown CLI runner/,
+        );
+
+        // The override really created (and then cleaned up) a worktree: the
+        // branch is the evidence that survives.
+        const branches = execFileSync("git", ["branch", "--list", "pi-subagent/*"], {
+          cwd: repo,
+          encoding: "utf8",
+        }).trim();
+        assert.notEqual(
+          branches,
+          "",
+          "worktree: true on the batch must isolate an agent that never declared it",
+        );
+      } finally {
+        if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prev;
+        rmSync(repo, { recursive: true, force: true });
+      }
+    });
+
+    it("reports a cli: claude child's own final message, not its screen", async () => {
+      // The Stop hook's sentinel file is the only place the agent's real final
+      // message lives. Falling back to the 200-line pane scrape hands the
+      // orchestrator terminal noise and defeats output-schema validation.
+      const dir = mkdtempSync(join(tmpdir(), "pi-claude-final-"));
+      const surface = createTrackedSurface(env, "claude-final-probe");
+      await sleep(900);
+
+      try {
+        const sentinelFile = join(dir, "sentinel");
+        writeFileSync(sentinelFile, "  CLAUDE FINAL ANSWER\n");
+
+        const running = {
+          id: "claudefinal",
+          name: "claude-final-probe",
+          task: "whatever",
+          surface,
+          startTime: Date.now(),
+          sessionFile: join(dir, "never.jsonl"),
+          cli: "claude",
+          sentinelFile,
+          interactive: false,
+          statusState: null as any,
+        };
+
+        const result = await (subagentsModule as any).__test__.watchSubagent(
+          running,
+          new AbortController().signal,
+        );
+
+        assert.equal(
+          result.summary,
+          "CLAUDE FINAL ANSWER",
+          `the sentinel's contents are the result, got: ${JSON.stringify(result.summary)}`,
+        );
+      } finally {
+        untrackSurface(env, surface);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("leaves a timed-out sub-agent's pane open and its worktree alone", async () => {
+      // A timeout means we stopped WATCHING, not that the agent stopped. If it
+      // fell through to the completion path it would close the pane of an
+      // agent that is still working and commit its half-done worktree.
+      const dir = mkdtempSync(join(tmpdir(), "pi-timeout-"));
+      const surface = createTrackedSurface(env, "timeout-probe");
+      await sleep(1000);
+      sendCommand(surface, "sleep 60");
+      await sleep(800);
+
+      const savedMax = process.env.PI_SUBAGENT_MAX_MS;
+      process.env.PI_SUBAGENT_MAX_MS = "600";
+      try {
+        const running = {
+          id: "timeoutprobe",
+          name: "timeout-probe",
+          task: "sleep",
+          surface,
+          startTime: Date.now(),
+          sessionFile: join(dir, "never.jsonl"),
+          interactive: false,
+          statusState: null as any,
+        };
+
+        const result = await (subagentsModule as any).__test__.watchSubagent(
+          running,
+          new AbortController().signal,
+        );
+
+        assert.match(
+          result.summary ?? "",
+          /still running in its pane/i,
+          `a timeout must say the agent is still alive, got: ${result.summary}`,
+        );
+        // The decisive part: the pane it was watching is untouched.
+        assert.notEqual(
+          tabOf(surface),
+          null,
+          "a timeout must NOT close the pane of an agent that is still working",
+        );
+      } finally {
+        if (savedMax === undefined) delete process.env.PI_SUBAGENT_MAX_MS;
+        else process.env.PI_SUBAGENT_MAX_MS = savedMax;
+        // Same reason: do not leave a `sleep` pane squeezing the layout.
+        closeSurface(surface);
+        untrackSurface(env, surface);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("stops watching a pane that has gone away, instead of re-arming forever", async () => {
+      // `wait-output` on a vanished pane errors immediately; re-arming with no
+      // liveness check forked one `herdr` process per second for the rest of
+      // the session, and the subagent was never reported at all.
+      const dir = mkdtempSync(join(tmpdir(), "pi-gone-"));
+      try {
+        const result = await pollForExit("w9:p99", new AbortController().signal, {
+          interval: 300,
+          doneId: "goneprobe",
+          sessionFile: join(dir, "never.jsonl"),
+          maxMs: 30_000,
+        });
+        assert.equal(result.reason, "error");
+        assert.match(result.errorMessage ?? "", /pane disappeared/i);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
 
     it("opens the pane in the requested cwd", async () => {

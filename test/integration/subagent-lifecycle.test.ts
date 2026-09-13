@@ -31,6 +31,8 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
+  isTestModelReady,
   type TestEnv,
 } from "./harness.ts";
 
@@ -41,7 +43,17 @@ if (backends.length === 0) {
   console.log("   Run inside a herdr pane to enable these tests.");
 }
 
-for (const backend of backends) {
+// These tests drive a real pi, which drives a real model. Without credentials
+// pi launches, renders its banner and waits — so every test here would fail on
+// a multi-minute timeout that says nothing about why. Check once, say so, skip.
+const auth = backends.length > 0 ? isTestModelReady() : { ready: true, detail: "" };
+if (backends.length > 0 && !auth.ready) {
+  console.log(`⚠️  pi cannot reach ${TEST_MODEL} (auth check: ${auth.detail}) —`);
+  console.log("   skipping subagent lifecycle integration tests.");
+  console.log("   Authenticate pi for that provider, or set PI_TEST_MODEL to one you have.");
+}
+
+for (const backend of auth.ready ? backends : []) {
   describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
     let env: TestEnv;
 

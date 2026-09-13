@@ -800,6 +800,18 @@ export function sentinelPattern(id: string): string {
  * second for the rest of the session), so that case calls `onGone` instead and
  * stops: the caller decides whether the agent really finished.
  */
+/**
+ * Did `pane wait-output` fail because the pane is gone, rather than because
+ * herdr hiccuped?
+ *
+ * A gone pane is terminal for that watch — re-arming would fork a `herdr`
+ * process every second for the rest of the session. Anything else is worth
+ * retrying. Split out so both answers can be tested without a live pane.
+ */
+function isPaneGoneError(stderr: unknown, error: unknown): boolean {
+  return /pane_not_found|pane .* not found/i.test(String(stderr ?? "") + String(error ?? ""));
+}
+
 function watchForSentinel(
   surface: string,
   id: string,
@@ -831,7 +843,7 @@ function watchForSentinel(
         onExit(parseInt(match[1], 10));
         return;
       }
-      if (/pane_not_found|not found/i.test(String(stderr ?? "") + String(error ?? ""))) {
+      if (isPaneGoneError(stderr, error)) {
         onGone();
         return;
       }
@@ -886,7 +898,15 @@ function interpretExitSidecar(data: any): PollResult {
 export const __pollForExitTest__ = { interpretExitSidecar };
 
 /** Socket-level internals, exposed so the failure modes can be tested. */
-export const __herdrApiTest__ = { herdrApi, isBusyProcessInfo };
+export const __herdrApiTest__ = {
+  herdrApi,
+  isBusyProcessInfo,
+  isPaneGoneError,
+  rebalanceSurfaces,
+  rebalanceInFlight,
+  rebalanceRerun,
+  rebalanceTimers,
+};
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first

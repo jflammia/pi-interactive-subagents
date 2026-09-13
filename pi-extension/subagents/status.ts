@@ -170,7 +170,16 @@ function readStatusConfigFile(configPath: string, examplePath: string): { source
   }
 }
 
-export function loadStatusConfig(
+/**
+ * Strict load: throws on a missing or malformed config.
+ *
+ * NOT exported. This runs at module scope in index.ts, where a throw takes the
+ * whole extension down and every subagent tool with it — over a file whose
+ * entire contents are one boolean controlling a cosmetic widget. Callers get
+ * `resolveStatusConfig` instead, so there is no unsafe entry point to reach
+ * for by accident. Tests use `__statusConfigTest__`.
+ */
+function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
 ): StatusConfig {
@@ -197,6 +206,9 @@ export function loadStatusConfig(
  * bad one must degrade to the default, not brick spawning. The strict loader
  * stays exported and strict for the tests and for anyone who wants the throw.
  */
+/** Strict loader, for the tests that pin its error messages. */
+export const __statusConfigTest__ = { loadStatusConfig };
+
 export function resolveStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
