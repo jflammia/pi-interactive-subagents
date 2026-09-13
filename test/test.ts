@@ -3615,6 +3615,28 @@ describe("fixes the review found untested", () => {
     assert.equal(__herdrApiTest__.isBusyProcessInfo({}), false, "a shapeless reply must fail open");
   });
 
+  it("reads every boolean frontmatter key with the same dialect", () => {
+    // One frontmatter block must not have two boolean dialects — the field
+    // that hides an agent from the model is the worst place for a silent no.
+    const parsed = testApi.parseAgentDefinition(
+      [
+        "---",
+        "name: dialect",
+        "worktree: Yes",
+        "auto-exit: On",
+        "disable-model-invocation: Yes",
+        "---",
+        "",
+        "body",
+        "",
+      ].join("\n"),
+      "dialect",
+    );
+    assert.equal(parsed.worktree, true);
+    assert.equal(parsed.autoExit, true);
+    assert.equal(parsed.disableModelInvocation, true, "the same spelling must mean the same thing");
+  });
+
   it("rejects the loose boolean spellings YAML does not mean", () => {
     // A parser that accepted anything truthy would pass the True/Yes tests.
     assert.equal(testApi.parseOptionalBoolean("no"), false);
@@ -3747,5 +3769,117 @@ describe("fixes the review found untested", () => {
       "scout",
     );
     assert.doesNotMatch(presentation, /output-schema/);
+  });
+});
+
+describe("the resume guard's wiring, not just its predicate", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("persists the launching pane and its herdr session in the registry", () => {
+    // Dropping `surface:` from the registerName calls restores the original
+    // bug in full while every predicate test keeps passing.
+    withTempDir((dir) => {
+      registerName(dir, "scout", {
+        sessionFile: join(dir, "scout.jsonl"),
+        sessionId: "019f-abc",
+        surface: "w1:p7",
+        herdrSession: "probe-session",
+      });
+
+      const entry = readNameRegistry(dir)["scout"];
+      assert.equal(entry.surface, "w1:p7", "the registry must carry the pane");
+      assert.equal(entry.herdrSession, "probe-session");
+
+      // And that entry is exactly what the guard consults.
+      assert.equal(
+        testApi.resumeBlockedByLiveRun(entry, () => true, "probe-session"),
+        true,
+      );
+    });
+  });
+
+  it("builds a registry entry that carries the pane and its herdr session", () => {
+    // Every registerName call routes through this, so dropping either field
+    // here is what would silently restore the two-writers-on-one-session bug.
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "scout.jsonl");
+      writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "019f-abc" }) + "\n");
+
+      const saved = process.env.HERDR_SESSION;
+      process.env.HERDR_SESSION = "probe-session";
+      try {
+        const entry = testApi.registryEntryFor({ sessionFile, surface: "w1:p7" });
+        assert.equal(entry.sessionFile, sessionFile);
+        assert.equal(entry.surface, "w1:p7", "the pane is what makes the guard possible");
+        assert.equal(entry.herdrSession, "probe-session");
+      } finally {
+        if (saved === undefined) delete process.env.HERDR_SESSION;
+        else process.env.HERDR_SESSION = saved;
+      }
+    });
+  });
+
+  it("ignores a pane recorded under a different herdr session", () => {
+    // Pane ids restart at w1 in every herdr session, so a stale id can name an
+    // unrelated live pane — often the parent's own, which is always busy.
+    const stale = { surface: "w1:p1", herdrSession: "old-session" };
+    assert.equal(
+      testApi.resumeBlockedByLiveRun(stale, () => true, "current-session"),
+      false,
+      "a pane id from another herdr session must not block a resume",
+    );
+    assert.equal(
+      testApi.resumeBlockedByLiveRun({ surface: "w1:p1" }, () => true, "current-session"),
+      false,
+      "an entry predating the session field must not block either",
+    );
+  });
+});
+
+describe("a fork child's result is its own, not the parent's", () => {
+  it("scans past the seeded parent messages", () => {
+    // A fork seed copies the PARENT's assistant messages into the child's
+    // session file. Scanning from 0 hands the orchestrator its own last
+    // message back as the sub-agent's answer, masking a child that died
+    // before saying anything.
+    withTempDir((dir) => {
+      const parent = join(dir, "parent.jsonl");
+      writeFileSync(
+        parent,
+        [
+          JSON.stringify({ type: "session", version: 3, id: "p", cwd: dir }),
+          JSON.stringify({
+            type: "message",
+            message: { role: "assistant", content: [{ type: "text", text: "PARENT SAID THIS" }] },
+          }),
+        ].join("\n") + "\n",
+      );
+
+      const child = join(dir, "child.jsonl");
+      const seeded = seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parent,
+        childSessionFile: child,
+        childCwd: dir,
+      });
+
+      assert.ok(seeded >= 2, "the fork seed must carry the parent's message");
+      assert.match(
+        findLastAssistantMessage(getNewEntries(child, 0)) ?? "",
+        /PARENT SAID THIS/,
+        "scanning from 0 finds the parent's words — this is the bug",
+      );
+      assert.equal(
+        findLastAssistantMessage(getNewEntries(child, seeded)),
+        null,
+        "scanning from the seed baseline finds nothing, because the child said nothing",
+      );
+
+      // And that is what the extractor actually uses.
+      const testApi = (subagentsModule as any).__test__;
+      assert.equal(testApi.childFinalMessage(child, seeded), null);
+      assert.match(testApi.childFinalMessage(child, 0) ?? "", /PARENT SAID THIS/);
+      assert.equal(testApi.childFinalMessage(join(dir, "nope.jsonl"), 0), null);
+    });
   });
 });

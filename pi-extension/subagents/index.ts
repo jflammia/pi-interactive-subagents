@@ -364,7 +364,7 @@ function parseAgentDefinition(raw: string, fallbackName: string): AgentDefinitio
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
     disableModelInvocation:
-      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+      (parseOptionalBoolean(getFrontmatterValue(frontmatter, "disable-model-invocation")) ?? false),
     worktree: parseOptionalBoolean(getFrontmatterValue(frontmatter, "worktree")),
     outputSchema: parseOutputSchema(getFrontmatterValue(frontmatter, "output-schema") ?? getFrontmatterValue(frontmatter, "output_schema")),
   };
@@ -751,6 +751,11 @@ interface RunningSubagent {
   worktreePath?: string;
   /** JSON Schema for structured output validation, if the agent declares one. */
   outputSchema?: unknown;
+  /**
+   * Session lines written by the seed, not by the child. Only non-zero for a
+   * `fork` spawn, whose seed carries the parent's own assistant messages.
+   */
+  seededLines?: number;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1329,11 +1334,48 @@ function assertCliToolsCompatible(
  * serve. Only an actually-busy pane blocks, and an entry with no recorded pane
  * (written before this field existed) never blocks.
  */
+/**
+ * The registry entry for a running sub-agent.
+ *
+ * Built in one place because resume-by-name depends on every field: the pane
+ * and its herdr session are what let a later pi tell a live orphan from a
+ * finished one, and omitting them silently restores the two-writers bug.
+ */
+function registryEntryFor(running: {
+  sessionFile: string;
+  surface?: string;
+}): { sessionFile: string; sessionId: string | null; surface?: string; herdrSession?: string } {
+  return {
+    sessionFile: running.sessionFile,
+    sessionId: getSessionId(running.sessionFile),
+    surface: running.surface,
+    herdrSession: process.env.HERDR_SESSION,
+  };
+}
+
+/**
+ * The child's own final message, ignoring anything the seed wrote.
+ *
+ * A `fork` seed copies the parent's assistant messages into the child's
+ * session file, so scanning from 0 can return the orchestrator's own words as
+ * the sub-agent's answer.
+ */
+function childFinalMessage(sessionFile: string, seededLines: number): string | null {
+  if (!existsSync(sessionFile)) return null;
+  return findLastAssistantMessage(getNewEntries(sessionFile, seededLines)) ?? null;
+}
+
 function resumeBlockedByLiveRun(
-  entry: { surface?: string },
+  entry: { surface?: string; herdrSession?: string },
   isBusy: (surface: string) => boolean = paneBusy,
+  currentHerdrSession: string | undefined = process.env.HERDR_SESSION,
 ): boolean {
-  return !!entry.surface && isBusy(entry.surface);
+  if (!entry.surface) return false;
+  // Pane ids are per-herdr-session and restart at w1, so an id recorded under
+  // a different session can name an unrelated live pane — quite possibly the
+  // parent's own, which is always busy. Unreadable means unblocked.
+  if ((entry.herdrSession ?? "") !== (currentHerdrSession ?? "")) return false;
+  return isBusy(entry.surface);
 }
 
 function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolean } {
@@ -1359,6 +1401,8 @@ export const __test__ = {
   parseOptionalBoolean,
   resolvePiSummary,
   structuredFields,
+  registryEntryFor,
+  childFinalMessage,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1508,8 +1552,13 @@ async function launchSubagentInner(
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
+  // Lines the child did not write. A `fork` seed copies the PARENT's assistant
+  // messages into the child's session file, so a result extractor scanning
+  // from 0 can hand the orchestrator its own last message back as the
+  // sub-agent's answer — masking a child that died before saying anything.
+  let seededLines = 0;
   if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
+    seededLines = seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
       parentSessionFile: sessionFile,
       childSessionFile: subagentSessionFile,
@@ -1750,6 +1799,7 @@ async function launchSubagentInner(
     }),
     ...(worktreePath ? { worktreePath } : {}),
     ...(agentDefs?.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
+    ...(seededLines > 0 ? { seededLines } : {}),
   };
 
   runningSubagents.set(id, running);
@@ -1890,6 +1940,10 @@ async function watchSubagent(
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
+        // ponytail: observeRunningSubagent also runs from the status interval,
+        // so it reads each subagent's activity file twice a second. Accepted:
+        // two small reads per subagent, and syncHerdrAgentState short-circuits
+        // unless the state actually changed. Collapse it if the file grows.
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
       },
@@ -1977,7 +2031,7 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     const { summary, isFinalMessage: summaryIsFinalMessage } = resolvePiSummary(
-      existsSync(sessionFile) ? findLastAssistantMessage(getNewEntries(sessionFile, 0)) : null,
+      childFinalMessage(sessionFile, running.seededLines ?? 0),
       result,
     );
 
@@ -2210,11 +2264,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Persist name → session so subagent_message({ name }) can resume this
         // subagent after it finishes (and after a pi restart). Done at launch,
         // not completion, so the handle exists even if the parent dies mid-run.
-        registerName(parentArtifactDir, running.name, {
-          sessionFile: running.sessionFile,
-          sessionId: getSessionId(running.sessionFile),
-          surface: running.surface,
-        });
+        registerName(parentArtifactDir, running.name, registryEntryFor(running));
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2684,8 +2734,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // liveness guard below would consult a stale surface next time.
         registerName(parentArtifactDir, name, {
           sessionFile: sessionPath,
-          sessionId: resumedSessionId,
+          // Only a real id: resumedSessionId falls back to the agent's NAME
+          // for display, and persisting that would stick in the registry.
+          sessionId: entry.sessionId ?? getSessionId(sessionPath),
           surface,
+          herdrSession: process.env.HERDR_SESSION,
         });
         startWidgetRefresh();
         startStatusRefresh(pi);
@@ -2885,11 +2938,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               { worktree: params.worktree },
             );
 
-            registerName(parentArtifactDir, running.name, {
-              sessionFile: running.sessionFile,
-              sessionId: getSessionId(running.sessionFile),
-              surface: running.surface,
-            });
+            registerName(parentArtifactDir, running.name, registryEntryFor(running));
 
             const watcherAbort = new AbortController();
             running.abortController = watcherAbort;

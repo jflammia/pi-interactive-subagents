@@ -395,6 +395,12 @@ export default function (pi: ExtensionAPI) {
         throw err;
       }
 
+      // ponytail: a pending question is deliberately unbounded — no deadline,
+      // no escalation to `stalled`. A waiting child is healthy-idle by design
+      // (test/test.ts "classifies waiting snapshots as healthy idle"), and the
+      // parent's own watch timeout is the backstop. Add a ceiling only if
+      // parked children turn out to be lost in practice rather than waited on.
+      //
       // Only now keep the session open: suppress auto-exit for this turn and
       // park in the "waiting" phase. Setting this BEFORE the write meant a
       // failed publish left the child parked forever with no signal at all —

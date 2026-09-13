@@ -159,7 +159,7 @@ export function seedSubagentSessionFile(params: {
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
-}): void {
+}): number {
   const header = {
     type: "session",
     version: 3,
@@ -174,6 +174,10 @@ export function seedSubagentSessionFile(params: {
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+  // How many lines the child did NOT write. A fork seed carries the PARENT's
+  // assistant messages, so a result extractor that scans from 0 can report the
+  // orchestrator's own last message back to it as the child's answer.
+  return lines.length;
 }
 
 /**
@@ -266,6 +270,12 @@ export interface NameRegistryEntry {
    * written before this existed must still load.
    */
   surface?: string;
+  /**
+   * The herdr session that pane id belongs to. Pane ids restart at w1 in every
+   * herdr session, so an id from a previous one can name an unrelated live
+   * pane — often the parent's own. Recorded so a mismatch can skip the probe.
+   */
+  herdrSession?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

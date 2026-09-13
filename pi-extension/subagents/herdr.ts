@@ -212,6 +212,11 @@ const rebalanceInFlight = new Set<SurfacePlacement>();
 /** Placements that asked for a rebalance while one was already running. */
 const rebalanceRerun = new Set<SurfacePlacement>();
 
+// ponytail: each pass is O(panes) socket calls and the 120ms debounce cannot
+// coalesce spawns, because they are serialized by the shell-ready delay — so a
+// parallel batch of n costs ~O(n^2) calls overall. Accepted: measured in
+// milliseconds at the pane counts a screen can hold. Batch the ratio writes if
+// that stops being true.
 function rebalanceSurfaces(placement: SurfacePlacement): void {
   const pending = rebalanceTimers.get(placement);
   if (pending) clearTimeout(pending);
