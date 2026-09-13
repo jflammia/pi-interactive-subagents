@@ -303,6 +303,29 @@ a global hook, so those panes already report for themselves.
 herdr        # then run `pi` in a pane
 ```
 
+## Tests
+
+```bash
+npm test                 # unit suite, no herdr or model needed
+```
+
+The integration suite drives real herdr panes, so it needs a herdr session and
+skips itself when it cannot find one. Point it at a throwaway session rather
+than your working one — it creates and closes panes:
+
+```bash
+herdr --session ittest &                      # a scratch session, once
+HERDR_ENV=1 HERDR_SESSION=ittest HERDR_PANE_ID=w1:p1 \
+  node --test --test-concurrency=1 test/integration/herdr-surface.test.ts
+herdr session stop ittest && herdr session delete ittest
+```
+
+`test/integration/subagent-lifecycle.test.ts` goes further and drives a real
+pi against a real model, so it additionally needs pi to be authenticated for
+`PI_TEST_MODEL` (default `anthropic/claude-haiku-4-5`). Without that it skips
+and says so — check with `pi auth check --model <model>`, which must print
+`ready`.
+
 ## Acknowledgements
 
 Lineage:
