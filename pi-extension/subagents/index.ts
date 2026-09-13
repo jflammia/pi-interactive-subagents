@@ -20,6 +20,7 @@ import {
   createSurface,
   sendCommand,
   sendLongCommand,
+  paneBusy,
   pollForExit,
   sentinelEcho,
   sentinelPattern,
@@ -1292,6 +1293,27 @@ function assertCliToolsCompatible(
   );
 }
 
+/**
+ * Should a resume be refused because the recorded run is still working?
+ *
+ * The in-memory guard only sees subagents THIS pi process launched, and that
+ * map is rebuilt empty on every load — so after a parent restart (or a crash),
+ * resuming by name started a second `pi --session <same file>` against a child
+ * that was still running, with two processes appending to one .jsonl.
+ *
+ * Deliberately narrow. A pane that merely EXISTS proves nothing: panes outlive
+ * their command and nothing closes an orphan's pane, so an existence check
+ * would refuse resume forever for exactly the orphans resume-by-name exists to
+ * serve. Only an actually-busy pane blocks, and an entry with no recorded pane
+ * (written before this field existed) never blocks.
+ */
+function resumeBlockedByLiveRun(
+  entry: { surface?: string },
+  isBusy: (surface: string) => boolean = paneBusy,
+): boolean {
+  return !!entry.surface && isBusy(entry.surface);
+}
+
 function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolean } {
   return { autoExit: true, interactive: false };
 }
@@ -1309,6 +1331,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
+  resumeBlockedByLiveRun,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -2133,6 +2156,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         registerName(parentArtifactDir, running.name, {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
+          surface: running.surface,
         });
 
         // Create a separate AbortController for the watcher
@@ -2453,6 +2477,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
+        // Same guard for a run THIS process did not launch. The map above is
+        // rebuilt empty on every load, so a child that outlived its parent is
+        // invisible to it — and resuming one starts a second pi on the same
+        // .jsonl.
+        if (resumeBlockedByLiveRun(entry)) {
+          const err =
+            `Subagent "${requestedName}" is still running in pane ${entry.surface} — it outlived the ` +
+            `pi session that launched it, so this session cannot steer it. Resuming would start a ` +
+            `second process on the same session file and corrupt it. Let it finish, or close that ` +
+            `pane, then resume.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
         // Reconstruct the sandbox from the snapshot written at spawn time.
         // Without it we cannot safely resume: relaunching bare would load every
         // global extension + the full toolset. Refuse rather than escalate.
@@ -2585,6 +2622,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        // Re-point the registry at the pane this resume actually opened.
+        // Without this the entry kept naming the original run's pane, so the
+        // liveness guard below would consult a stale surface next time.
+        registerName(parentArtifactDir, name, {
+          sessionFile: sessionPath,
+          sessionId: resumedSessionId,
+          surface,
+        });
         startWidgetRefresh();
         startStatusRefresh(pi);
 
@@ -2776,6 +2821,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             registerName(parentArtifactDir, running.name, {
               sessionFile: running.sessionFile,
               sessionId: getSessionId(running.sessionFile),
+              surface: running.surface,
             });
 
             const watcherAbort = new AbortController();

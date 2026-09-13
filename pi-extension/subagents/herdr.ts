@@ -694,6 +694,29 @@ function readArgs(surface: string, lines: number, source: string): string[] {
 }
 
 /**
+ * True when something other than the bare shell is running in this pane.
+ *
+ * NOT the same as "the pane exists". A pane outlives the command that ran in
+ * it — the launch script drops back to a shell prompt when the sub-agent
+ * exits, and only the parent's watcher ever calls closeSurface. So a pane left
+ * behind by a dead parent exists forever, and an existence check would refuse
+ * resume-by-name for exactly the orphans that feature exists to serve.
+ *
+ * Fails open: a pane that is gone, or a herdr that cannot be reached, answers
+ * false. This gates a refusal, so uncertainty must not block the user.
+ */
+export function paneBusy(surface: string): boolean {
+  try {
+    const info = JSON.parse(herdrCli(["pane", "process-info", "--pane", surface]))?.result
+      ?.process_info;
+    if (!info) return false;
+    return info.foreground_process_group_id !== info.shell_pid;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Close a pane. Idempotent: closing a pane that is already gone succeeds.
  */
 export function closeSurface(surface: string): void {

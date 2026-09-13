@@ -76,6 +76,7 @@ import {
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import {
   __pollForExitTest__,
+  paneBusy,
   pollForExit,
   sentinelEcho,
   sentinelPattern,
@@ -3385,5 +3386,45 @@ describe("the Claude Stop hook signals completion on every turn boundary", () =>
       runHook({ stop_hook_active: true, last_assistant_message: "should not appear" }, sentinel);
       assert.equal(existsSync(sentinel), false, "stop_hook_active must still short-circuit");
     });
+  });
+});
+
+describe("resume refuses a run that outlived its parent", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("blocks only when the recorded pane is actually busy", () => {
+    // The in-memory guard sees only subagents THIS process launched, and that
+    // map is empty after a restart — so resume-by-name could start a second
+    // pi on a .jsonl a live orphan was still appending to.
+    assert.equal(
+      testApi.resumeBlockedByLiveRun({ surface: "w1:p2" }, () => true),
+      true,
+      "a busy pane must block the resume",
+    );
+  });
+
+  it("does not block on a pane that merely exists", () => {
+    // A pane outlives its command: the launch script falls back to a shell
+    // prompt, and only the parent's watcher ever closes the pane. An orphan's
+    // pane therefore exists forever, so an existence check would permanently
+    // refuse the resume-by-name that orphans exist to use.
+    assert.equal(
+      testApi.resumeBlockedByLiveRun({ surface: "w1:p2" }, () => false),
+      false,
+      "an idle pane must not block the resume",
+    );
+  });
+
+  it("never blocks an entry written before panes were recorded", () => {
+    assert.equal(
+      testApi.resumeBlockedByLiveRun({}, () => true),
+      false,
+      "registries without a surface must stay resumable",
+    );
+  });
+
+  it("treats an unreachable herdr as not-busy", () => {
+    // paneBusy gates a refusal, so uncertainty must not block the user.
+    assert.equal(paneBusy("w99:p99"), false, "a pane that is gone must read as not busy");
   });
 });

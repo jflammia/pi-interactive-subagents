@@ -260,6 +260,12 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /**
+   * Pane this session's current run occupies, so a later pi can ask whether it
+   * is still working before resuming into the same .jsonl. Optional: registries
+   * written before this existed must still load.
+   */
+  surface?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
