@@ -173,6 +173,7 @@ You are a specialized agent that does X...
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `pane-placement` | string | `split` (default) tiles the pane in pi's tab; `tab` puts it in a dedicated subagent tab, leaving pi's window full-size |
 | `cwd` | string | Default working directory |
+| `worktree` | boolean | Run this agent in its own git worktree so parallel editors don't collide (see below) |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi (outside pi's tool allowlist — cannot be combined with `tools:`) |
 | `output-schema` | string | JSON Schema the agent's final message must satisfy — inline JSON, or a path to a `.json` file |
@@ -195,6 +196,21 @@ Notes:
 ### interactive
 
 Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
+
+### worktree
+
+`worktree: true` launches the sub-agent in a fresh git worktree on its own
+`pi-subagent/<name>-<id>` branch, so several agents can edit the same repo at
+once without colliding. `subagents_parallel({ worktree: true })` applies it to a
+whole batch regardless of what each agent declares.
+
+On completion whatever the agent left uncommitted is committed to that branch
+and the worktree directory is removed — the branch is the handle, and it comes
+back in the result as `worktreeBranch`. Nothing is merged for you.
+
+A worktree is a fresh checkout, so the agent sees **committed files only**:
+untracked project agents under `.pi/agents/`, `.env` files and `node_modules`
+are not there. Agents that need any of those should not declare `worktree`.
 
 ### output-schema
 

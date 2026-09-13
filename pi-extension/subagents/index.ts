@@ -273,7 +273,12 @@ function getFrontmatterValue(frontmatter: string, key: string): string | undefin
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-  return value != null ? value === "true" : undefined;
+  // `worktree: True` / `auto-exit: Yes` are valid YAML booleans, and a strict
+  // `=== "true"` read them as false — silently disabling isolation or
+  // auto-exit with no warning anywhere. Accept the YAML 1.1 spellings.
+  if (value == null) return undefined;
+  const v = value.trim().toLowerCase();
+  return v === "true" || v === "yes" || v === "on";
 }
 
 /** Parse an output-schema frontmatter value as a JSON object. */
@@ -1343,11 +1348,36 @@ function startWidgetRefresh() {
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
  * Call watchSubagent() on the returned object to observe completion.
+ *
+ * Nothing owns the worktree until the returned object lands in
+ * runningSubagents, so a throw in between — a herdr hiccup, a bad `cli:`
+ * value, a failed mkdir — used to leak it with no cleanup owner anywhere.
+ * This wrapper finishes anything the inner function created before rethrowing.
+ *
+ * ponytail: deliberately NOT a startup sweep over listSubagentWorktrees().
+ * runningSubagents is module-local to ONE pi process, so a second session in
+ * the same repo would sweep the first session's LIVE worktree — trading
+ * clutter for data loss. Leave that to an operator-invoked cleanup.
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string; worktree?: boolean },
+): Promise<RunningSubagent> {
+  const created: string[] = [];
+  try {
+    return await launchSubagentInner(params, ctx, options, created);
+  } catch (err) {
+    for (const path of created) finishWorktree(path);
+    throw err;
+  }
+}
+
+async function launchSubagentInner(
+  params: typeof SubagentParams.static,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  options: { surface?: string; worktree?: boolean } | undefined,
+  created: string[],
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1379,6 +1409,7 @@ async function launchSubagent(
   if (agentDefs?.worktree || options?.worktree) {
     try {
       worktreePath = createWorktree(targetCwdForSession, params.name || params.agent || "subagent");
+      created.push(worktreePath);
       effectiveCwdForLaunch = worktreePath;
     } catch (err: any) {
       throw new Error(`Failed to create worktree for subagent: ${err?.message ?? String(err)}`);

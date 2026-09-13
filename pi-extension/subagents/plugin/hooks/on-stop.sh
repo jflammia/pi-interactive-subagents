@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stop hook for pi-spawned Claude sessions.
-# Writes a sentinel file when Claude completes autonomously (no user interjection).
+# Writes the sentinel file that tells the parent this session finished a turn.
 
 set -euo pipefail
 
@@ -18,51 +18,36 @@ if [ -z "${PI_CLAUDE_SENTINEL:-}" ]; then
   exit 0
 fi
 
-# Get transcript path
-transcript_path=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('transcript_path', ''))" 2>/dev/null || echo "")
-if [ -z "$transcript_path" ] || [ ! -f "$transcript_path" ]; then
-  exit 0
+# Write the sentinel FIRST, unconditionally, before anything that can bail out.
+#
+# This file is the only completion signal the parent has for an interactive
+# `claude` child (see pollForExit in herdr.ts), and Stop only fires at a turn
+# boundary. The old version wrote it only when the transcript held exactly one
+# user message — meant as "no human interjected", but a Skill invocation, a
+# task notification or a single steer all add one, so completion detection
+# broke permanently for that session and the parent watched it until timeout.
+# It also sat behind the transcript guard below, so a transcript rotated away
+# meant no sentinel at all.
+#
+# last_assistant_message comes from the stdin payload, not the transcript, so
+# this write has no dependency on either.
+#
+# Temp + rename because the parent treats the file's EXISTENCE as completion:
+# a plain `>` truncates first, so a poll landing mid-write would see a complete
+# signal carrying an empty result.
+tmp="${PI_CLAUDE_SENTINEL}.$$"
+if echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('last_assistant_message', ''))" > "$tmp" 2>/dev/null; then
+  mv -f "$tmp" "$PI_CLAUDE_SENTINEL" || true
+else
+  rm -f "$tmp"
+  # Still signal completion — the parent falls back to scraping the pane.
+  : > "$PI_CLAUDE_SENTINEL"
 fi
 
-# Count real human messages in transcript (not tool results)
-# Claude's transcript format:
-#   Human message: {"type": "user", "message": {"role": "user", "content": "..."}}
-#   Tool result:   {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", ...}]}}
-# We only count entries where content is a string (real human input)
-user_msg_count=$(python3 - "$transcript_path" <<'EOF'
-import sys, json
-
-transcript_path = sys.argv[1]
-count = 0
-with open(transcript_path, 'r') as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            if entry.get('type') != 'user':
-                continue
-            content = entry.get('message', {}).get('content', '')
-            # Real human messages have string content
-            # Tool results have array content with tool_result blocks
-            if isinstance(content, str):
-                count += 1
-        except (json.JSONDecodeError, AttributeError):
-            pass
-print(count)
-EOF
-)
-
-# Always write transcript path so the watcher can copy the session file
+# Best-effort pointer so the watcher can copy the session transcript.
+transcript_path=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('transcript_path', ''))" 2>/dev/null || echo "")
 if [ -n "$transcript_path" ]; then
   echo "$transcript_path" > "${PI_CLAUDE_SENTINEL}.transcript" 2>/dev/null || true
-fi
-
-# If exactly 1 user message (the initial prompt), this was autonomous — signal completion
-if [ "$user_msg_count" -eq 1 ]; then
-  # Write last_assistant_message to sentinel so the watcher gets a clean result
-  echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('last_assistant_message', ''))" > "$PI_CLAUDE_SENTINEL" 2>/dev/null || touch "$PI_CLAUDE_SENTINEL"
 fi
 
 exit 0

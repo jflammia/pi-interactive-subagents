@@ -1,9 +1,18 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+} from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -1103,6 +1112,40 @@ describe("status.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+
+  it("accepts the YAML spellings of a boolean flag", async () => {
+    // `worktree: True` parsed as false and silently ran the agent in the
+    // shared tree — the isolation the key exists to provide, disabled with no
+    // warning anywhere.
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "yaml-bool-test-agent",
+        [
+          "name: yaml-bool-test-agent",
+          "model: anthropic/test-yaml-bool",
+          "worktree: True",
+          "auto-exit: Yes",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "yaml-bool-off-test-agent",
+        [
+          "name: yaml-bool-off-test-agent",
+          "model: anthropic/test-yaml-bool-off",
+          "worktree: False",
+        ].join("\n"),
+      );
+
+      const on = testApi.loadAgentDefaults("yaml-bool-test-agent");
+      assert.equal(on.worktree, true, "`worktree: True` must enable isolation");
+      assert.equal(on.autoExit, true, "`auto-exit: Yes` must enable auto-exit");
+
+      const off = testApi.loadAgentDefaults("yaml-bool-off-test-agent");
+      assert.equal(off.worktree, false, "`worktree: False` must stay off");
+    });
+  });
 
   it("parses agent definitions with a BOM or CRLF line endings", async () => {
     // Git for Windows checks .md out as CRLF, and an editor may leave a BOM.
@@ -3246,5 +3289,101 @@ describe("the widget interval does not run in a headless session", () => {
     const existing = currentInterval();
     if (existing) clearInterval(existing);
     (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  });
+});
+
+describe("the Claude Stop hook signals completion on every turn boundary", () => {
+  const HOOK = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "pi-extension",
+    "subagents",
+    "plugin",
+    "hooks",
+    "on-stop.sh",
+  );
+
+  function runHook(payload: object, sentinel: string, transcript?: string) {
+    const input = JSON.stringify(payload);
+    const result = execFileSync("bash", [HOOK], {
+      input,
+      encoding: "utf8",
+      env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel },
+    });
+    void result;
+    void transcript;
+  }
+
+  it("writes the sentinel even after a steer or a skill added user messages", () => {
+    // The hook used to fire only when the transcript held EXACTLY one user
+    // message. One steer — or any Skill invocation, which also appends one —
+    // meant no sentinel ever, and the parent watched a finished agent until
+    // its timeout.
+    withTempDir((dir) => {
+      const sentinel = join(dir, "sentinel");
+      const transcript = join(dir, "transcript.jsonl");
+      writeFileSync(
+        transcript,
+        [
+          JSON.stringify({ type: "user", message: { role: "user", content: "do the thing" } }),
+          JSON.stringify({ type: "assistant", message: { role: "assistant", content: "ok" } }),
+          JSON.stringify({ type: "user", message: { role: "user", content: "also this" } }),
+        ].join("\n") + "\n",
+      );
+
+      runHook(
+        {
+          stop_hook_active: false,
+          transcript_path: transcript,
+          last_assistant_message: "FINAL ANSWER",
+        },
+        sentinel,
+      );
+
+      assert.equal(existsSync(sentinel), true, "sentinel must be written regardless of user-message count");
+      assert.equal(readFileSync(sentinel, "utf-8").trim(), "FINAL ANSWER");
+      assert.equal(readFileSync(`${sentinel}.transcript`, "utf-8").trim(), transcript);
+    });
+  });
+
+  it("still signals completion when the transcript is gone", () => {
+    // last_assistant_message rides the stdin payload, so a rotated or
+    // compacted-away transcript must not suppress the only completion signal.
+    withTempDir((dir) => {
+      const sentinel = join(dir, "sentinel");
+
+      runHook(
+        {
+          stop_hook_active: false,
+          transcript_path: join(dir, "does-not-exist.jsonl"),
+          last_assistant_message: "DONE ANYWAY",
+        },
+        sentinel,
+      );
+
+      assert.equal(existsSync(sentinel), true, "a missing transcript must not suppress completion");
+      assert.equal(readFileSync(sentinel, "utf-8").trim(), "DONE ANYWAY");
+    });
+  });
+
+  it("leaves no temp files behind", () => {
+    withTempDir((dir) => {
+      const sentinel = join(dir, "sentinel");
+      runHook({ stop_hook_active: false, last_assistant_message: "x" }, sentinel);
+      const strays = readdirSync(dir).filter((f) => f.startsWith("sentinel."));
+      assert.deepEqual(
+        strays.filter((f) => f !== "sentinel.transcript"),
+        [],
+        "the atomic write must not leave a .$$ temp file",
+      );
+    });
+  });
+
+  it("does nothing when the loop guard is set", () => {
+    withTempDir((dir) => {
+      const sentinel = join(dir, "sentinel");
+      runHook({ stop_hook_active: true, last_assistant_message: "should not appear" }, sentinel);
+      assert.equal(existsSync(sentinel), false, "stop_hook_active must still short-circuit");
+    });
   });
 });
