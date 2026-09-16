@@ -484,6 +484,59 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   return null;
 }
 
+/**
+ * Read `subagents.agentOverrides` from the pi settings file
+ * (`<configDir>/settings.json`). Lets the user pin a per-agent model and
+ * optional thinking level without editing the bundled agent .md files, so
+ * package updates never revert it. Returns a map keyed by agent name.
+ */
+function loadSubagentAgentOverrides(): Record<string, { model?: string; thinking?: string }> {
+  const settingsPath = join(getAgentConfigDir(), "settings.json");
+  if (!existsSync(settingsPath)) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as unknown;
+  } catch {
+    return {};
+  }
+  const subagents = (parsed as { subagents?: unknown } | null)?.subagents;
+  const overrides = (subagents as { agentOverrides?: unknown } | null)?.agentOverrides;
+  if (!overrides || typeof overrides !== "object") return {};
+  const result: Record<string, { model?: string; thinking?: string }> = {};
+  for (const [name, value] of Object.entries(overrides as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as { model?: unknown; thinking?: unknown };
+    const entry: { model?: string; thinking?: string } = {};
+    if (typeof v.model === "string" && v.model) entry.model = v.model;
+    if (typeof v.thinking === "string" && v.thinking) entry.thinking = v.thinking;
+    if (entry.model || entry.thinking) result[name] = entry;
+  }
+  return result;
+}
+
+/**
+ * Resolve the model and thinking level a subagent launches with.
+ *
+ * Resolution order, highest first:
+ *   1. An explicit `model` spawn param. Only models — there is no thinking param.
+ *   2. `subagents.agentOverrides.<agent>` in settings.json: the user's own pin,
+ *      which a package update cannot revert.
+ *   3. The bundled agent .md frontmatter.
+ *
+ * Reads settings.json once so both fields come from one snapshot — a file
+ * rewritten mid-launch cannot pair one model with another thinking level.
+ */
+function resolveEffectiveModelAndThinking(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): { model: string | undefined; thinking: string | undefined } {
+  const override = params.agent ? loadSubagentAgentOverrides()[params.agent] : undefined;
+  return {
+    model: params.model ?? override?.model ?? agentDefs?.model,
+    thinking: override?.thinking ?? agentDefs?.thinking,
+  };
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -1459,6 +1512,8 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  loadSubagentAgentOverrides,
+  resolveEffectiveModelAndThinking,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
@@ -1557,7 +1612,8 @@ async function launchSubagentInner(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const { model: effectiveModel, thinking: effectiveThinking } =
+    resolveEffectiveModelAndThinking(params, agentDefs);
   const effectiveTools = agentDefs?.tools;
   // Before any pane or worktree exists, so a refusal leaks nothing.
   if (agentDefs?.toolsMisparsed) {
@@ -1569,7 +1625,6 @@ async function launchSubagentInner(
   }
   assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();

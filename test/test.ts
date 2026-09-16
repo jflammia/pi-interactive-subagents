@@ -174,6 +174,15 @@ function writeAgentFile(
   writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
 }
 
+/** Write the pi settings file a subagent override is read from. */
+function writeSettingsFile(globalDir: string, contents: unknown) {
+  mkdirSync(globalDir, { recursive: true });
+  writeFileSync(
+    join(globalDir, "settings.json"),
+    typeof contents === "string" ? contents : JSON.stringify(contents, null, 2),
+  );
+}
+
 async function withIsolatedAgentEnv(
   fn: (paths: {
     projectDir: string;
@@ -1293,6 +1302,199 @@ describe("subagent discovery", () => {
       ),
       false,
     );
+  });
+
+  it("loadSubagentAgentOverrides returns an empty map when settings.json is absent", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      assert.equal(existsSync(join(globalDir, "settings.json")), false);
+      assert.deepEqual(testApi.loadSubagentAgentOverrides(), {});
+    });
+  });
+
+  it("loadSubagentAgentOverrides reads model and thinking keyed by agent name", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: {
+            scout: { model: "anthropic/test-scout", thinking: "high" },
+            worker: { model: "anthropic/test-worker" },
+            researcher: { thinking: "low" },
+          },
+        },
+      });
+
+      assert.deepEqual(testApi.loadSubagentAgentOverrides(), {
+        scout: { model: "anthropic/test-scout", thinking: "high" },
+        worker: { model: "anthropic/test-worker" },
+        researcher: { thinking: "low" },
+      });
+    });
+  });
+
+  it("loadSubagentAgentOverrides survives a settings.json it cannot use", async () => {
+    // A user's settings file is hand-edited and shared with the rest of pi, so
+    // every one of these is reachable. None may throw at spawn time: the pin is
+    // a convenience, and losing it must never cost the user the launch.
+    const unusable: Array<[string, unknown]> = [
+      ["malformed JSON", "{ not json"],
+      ["an empty file", ""],
+      ["JSON null", "null"],
+      ["a top-level array", []],
+      ["no subagents key", { other: true }],
+      ["a non-object subagents", { subagents: "scout" }],
+      ["no agentOverrides key", { subagents: { other: true } }],
+      ["a non-object agentOverrides", { subagents: { agentOverrides: "scout" } }],
+      ["a null agentOverrides", { subagents: { agentOverrides: null } }],
+    ];
+
+    for (const [label, contents] of unusable) {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeSettingsFile(globalDir, contents);
+        assert.deepEqual(testApi.loadSubagentAgentOverrides(), {}, label);
+      });
+    }
+  });
+
+  it("loadSubagentAgentOverrides drops entries it cannot trust, keeping the rest", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: {
+            // Kept: the one well-formed entry.
+            scout: { model: "anthropic/test-scout" },
+            // Dropped: a non-string model would reach the CLI as `--model 42`.
+            "numeric-model": { model: 42 },
+            "object-model": { model: { name: "x" } },
+            "numeric-thinking": { thinking: 7 },
+            // Dropped: an empty string is not a model. `??` treats "" as a
+            // value, so keeping it would shadow the frontmatter default with
+            // nothing — reaching the CLI as an empty `--model`. The surrounding
+            // field must survive it.
+            "empty-model": { model: "" },
+            "empty-thinking": { thinking: "" },
+            "empty-model-kept-thinking": { model: "", thinking: "high" },
+            "empty-thinking-kept-model": { model: "anthropic/test-kept", thinking: "" },
+            // Dropped: nothing to override.
+            "empty-entry": {},
+            "null-entry": null,
+            "string-entry": "claude-opus-5",
+            // Kept in part: a bad thinking level must not cost the good model.
+            mixed: { model: "anthropic/test-mixed", thinking: false },
+          },
+        },
+      });
+
+      assert.deepEqual(testApi.loadSubagentAgentOverrides(), {
+        scout: { model: "anthropic/test-scout" },
+        "empty-model-kept-thinking": { thinking: "high" },
+        "empty-thinking-kept-model": { model: "anthropic/test-kept" },
+        mixed: { model: "anthropic/test-mixed" },
+      });
+    });
+  });
+
+  it("resolveEffectiveModelAndThinking prefers an override over the frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: { scout: { model: "anthropic/pinned", thinking: "high" } },
+        },
+      });
+
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "scout", task: "T" },
+          { model: "anthropic/bundled", thinking: "low" },
+        ),
+        { model: "anthropic/pinned", thinking: "high" },
+      );
+    });
+  });
+
+  it("resolveEffectiveModelAndThinking prefers an explicit model param over the override", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: { scout: { model: "anthropic/pinned", thinking: "high" } },
+        },
+      });
+
+      // The param wins for the model — but thinking has no param, so the
+      // override still supplies it rather than falling back to frontmatter.
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "scout", task: "T", model: "anthropic/explicit" },
+          { model: "anthropic/bundled", thinking: "low" },
+        ),
+        { model: "anthropic/explicit", thinking: "high" },
+      );
+    });
+  });
+
+  it("resolveEffectiveModelAndThinking overrides only the field the user pinned", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: {
+            "model-only": { model: "anthropic/pinned" },
+            "thinking-only": { thinking: "high" },
+          },
+        },
+      });
+
+      // A model pin leaves the agent's own thinking level alone...
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "model-only", task: "T" },
+          { model: "anthropic/bundled", thinking: "low" },
+        ),
+        { model: "anthropic/pinned", thinking: "low" },
+      );
+      // ...and a thinking pin leaves its model alone.
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "thinking-only", task: "T" },
+          { model: "anthropic/bundled", thinking: "low" },
+        ),
+        { model: "anthropic/bundled", thinking: "high" },
+      );
+    });
+  });
+
+  it("resolveEffectiveModelAndThinking applies an override only to the agent it names", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {
+        subagents: {
+          agentOverrides: { scout: { model: "anthropic/pinned", thinking: "high" } },
+        },
+      });
+
+      // A pin on `scout` must not leak onto every other agent's launch.
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "worker", task: "T" },
+          { model: "anthropic/bundled", thinking: "low" },
+        ),
+        { model: "anthropic/bundled", thinking: "low" },
+      );
+    });
+  });
+
+  it("resolveEffectiveModelAndThinking falls back cleanly with no settings file", async () => {
+    await withIsolatedAgentEnv(async () => {
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "scout", task: "T" },
+          { model: "anthropic/bundled", thinking: "low" },
+        ),
+        { model: "anthropic/bundled", thinking: "low" },
+      );
+      // A bare spawn with no agent defs at all resolves to nothing, not a throw.
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking({ agent: "scout", task: "T" }, null),
+        { model: undefined, thinking: undefined },
+      );
+    });
   });
 
   it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
