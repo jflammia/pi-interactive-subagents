@@ -484,6 +484,36 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   return null;
 }
 
+/**
+ * Read `subagents.agentOverrides` from the pi settings file
+ * (`<configDir>/settings.json`). Lets the user pin a per-agent model and
+ * optional thinking level without editing the bundled agent .md files, so
+ * package updates never revert it. Returns a map keyed by agent name.
+ */
+function loadSubagentAgentOverrides(): Record<string, { model?: string; thinking?: string }> {
+  const settingsPath = join(getAgentConfigDir(), "settings.json");
+  if (!existsSync(settingsPath)) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as unknown;
+  } catch {
+    return {};
+  }
+  const subagents = (parsed as { subagents?: unknown } | null)?.subagents;
+  const overrides = (subagents as { agentOverrides?: unknown } | null)?.agentOverrides;
+  if (!overrides || typeof overrides !== "object") return {};
+  const result: Record<string, { model?: string; thinking?: string }> = {};
+  for (const [name, value] of Object.entries(overrides as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as { model?: unknown; thinking?: unknown };
+    const entry: { model?: string; thinking?: string } = {};
+    if (typeof v.model === "string" && v.model) entry.model = v.model;
+    if (typeof v.thinking === "string" && v.thinking) entry.thinking = v.thinking;
+    if (entry.model || entry.thinking) result[name] = entry;
+  }
+  return result;
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -1557,7 +1587,10 @@ async function launchSubagentInner(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  // Per-agent overrides from settings.json (`subagents.agentOverrides`) win
+  // over the bundled .md frontmatter but yield to an explicit `model` param.
+  const agentOverride = params.agent ? loadSubagentAgentOverrides()[params.agent] : undefined;
+  const effectiveModel = params.model ?? agentOverride?.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   // Before any pane or worktree exists, so a refusal leaks nothing.
   if (agentDefs?.toolsMisparsed) {
@@ -1569,7 +1602,7 @@ async function launchSubagentInner(
   }
   assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = agentOverride?.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
