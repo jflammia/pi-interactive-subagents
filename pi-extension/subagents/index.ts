@@ -514,6 +514,29 @@ function loadSubagentAgentOverrides(): Record<string, { model?: string; thinking
   return result;
 }
 
+/**
+ * Resolve the model and thinking level a subagent launches with.
+ *
+ * Resolution order, highest first:
+ *   1. An explicit `model` spawn param. Only models — there is no thinking param.
+ *   2. `subagents.agentOverrides.<agent>` in settings.json: the user's own pin,
+ *      which a package update cannot revert.
+ *   3. The bundled agent .md frontmatter.
+ *
+ * Reads settings.json once so both fields come from one snapshot — a file
+ * rewritten mid-launch cannot pair one model with another thinking level.
+ */
+function resolveEffectiveModelAndThinking(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): { model: string | undefined; thinking: string | undefined } {
+  const override = params.agent ? loadSubagentAgentOverrides()[params.agent] : undefined;
+  return {
+    model: params.model ?? override?.model ?? agentDefs?.model,
+    thinking: override?.thinking ?? agentDefs?.thinking,
+  };
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -1489,6 +1512,8 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  loadSubagentAgentOverrides,
+  resolveEffectiveModelAndThinking,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
@@ -1587,10 +1612,8 @@ async function launchSubagentInner(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  // Per-agent overrides from settings.json (`subagents.agentOverrides`) win
-  // over the bundled .md frontmatter but yield to an explicit `model` param.
-  const agentOverride = params.agent ? loadSubagentAgentOverrides()[params.agent] : undefined;
-  const effectiveModel = params.model ?? agentOverride?.model ?? agentDefs?.model;
+  const { model: effectiveModel, thinking: effectiveThinking } =
+    resolveEffectiveModelAndThinking(params, agentDefs);
   const effectiveTools = agentDefs?.tools;
   // Before any pane or worktree exists, so a refusal leaks nothing.
   if (agentDefs?.toolsMisparsed) {
@@ -1602,7 +1625,6 @@ async function launchSubagentInner(
   }
   assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentOverride?.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
