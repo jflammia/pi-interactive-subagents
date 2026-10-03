@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createWorktree, finishWorktree, listSubagentWorktrees } from "../pi-extension/subagents/worktree.ts";
+import { createWorktree, finishWorktree, listSubagentWorktrees, worktreeNote } from "../pi-extension/subagents/worktree.ts";
+import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 function hasGit(): boolean {
   try {
@@ -161,6 +162,101 @@ test("finishWorktree commits work the subagent left uncommitted", { skip: !hasGi
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
+});
+
+// The branch name used to reach only `details`, which the orchestrator model
+// never sees: the work was saved and then unfindable. These pin the sentence
+// the model does read.
+test("worktreeNote names the branch and repo when the subagent left work", { skip: !hasGit() }, () => {
+  const repo = makeRepo();
+  try {
+    const wt = createWorktree(repo, "implementer");
+    writeFileSync(join(wt, "NEW.md"), "# subagent output\n");
+
+    const outcome = finishWorktree(wt)!;
+    assert.equal(outcome.ahead, 1);
+    assert.equal(outcome.repoRoot, realpathSync(repo));
+
+    const note = worktreeNote(outcome);
+    assert.ok(note.includes(`git branch \`${outcome.branch}\` in ${realpathSync(repo)}`), note);
+    assert.match(note, /Merge or cherry-pick/);
+    assert.match(note, /nothing was applied to your working tree/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("worktreeNote counts work the subagent committed itself", { skip: !hasGit() }, () => {
+  // A clean tree is not "no work": the agent may have committed as it went.
+  const repo = makeRepo();
+  try {
+    const wt = createWorktree(repo, "committer");
+    writeFileSync(join(wt, "NEW.md"), "# subagent output\n");
+    execFileSync("git", ["add", "."], { cwd: wt, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "own commit"], { cwd: wt, stdio: "ignore" });
+
+    const outcome = finishWorktree(wt)!;
+    assert.equal(outcome.commit, undefined, "nothing left for the save-point commit");
+    assert.equal(outcome.ahead, 1);
+    assert.match(worktreeNote(outcome), /Merge or cherry-pick/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("worktreeNote does not offer an empty branch as work to merge", { skip: !hasGit() }, () => {
+  const repo = makeRepo();
+  try {
+    const outcome = finishWorktree(createWorktree(repo, "idle"))!;
+    assert.equal(outcome.ahead, 0);
+
+    const note = worktreeNote(outcome);
+    assert.doesNotMatch(note, /Work from this subagent is on|Merge or cherry-pick/);
+    assert.match(note, /left no changes/);
+    assert.match(note, /nothing to merge/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a finished worktree's branch reaches the text the orchestrator reads", { skip: !hasGit() }, () => {
+  const { finishRunningWorktree, resolveResultPresentation } = (subagentsModule as any).__test__;
+  const repo = makeRepo();
+  try {
+    const wt = createWorktree(repo, "implementer");
+    writeFileSync(join(wt, "NEW.md"), "# subagent output\n");
+
+    const fields = finishRunningWorktree({ worktreePath: wt });
+    assert.ok(fields.worktreeBranch.startsWith("pi-subagent/implementer-"));
+
+    // Every path that hands a result to the model: completed, failed/cancelled,
+    // and the provider-error path, which returns early.
+    const results = [
+      { exitCode: 0, elapsed: 5, summary: "done" },
+      { exitCode: 1, elapsed: 5, summary: "Subagent cancelled." },
+      { exitCode: 1, elapsed: 5, summary: "", errorMessage: "overloaded" },
+    ];
+    for (const result of results) {
+      const text = resolveResultPresentation({ ...result, ...fields }, "implementer");
+      assert.ok(text.includes(`git branch \`${fields.worktreeBranch}\``), text);
+      // Before the follow-up hint, which the TUI strips.
+      assert.ok(text.indexOf("git branch") < text.indexOf("Follow up with"), text);
+      // Harness framing, not child-authored text: outside the untrusted fence.
+      assert.ok(text.indexOf("git branch") > text.indexOf("--- END SUBAGENT OUTPUT ---"), text);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a subagent without a worktree gets no branch line", () => {
+  const { finishRunningWorktree, resolveResultPresentation } = (subagentsModule as any).__test__;
+  assert.deepEqual(finishRunningWorktree({}), {});
+  // A worktree that is already gone preserved nothing, so claims nothing.
+  assert.deepEqual(finishRunningWorktree({ worktreePath: "/nonexistent/path" }), {});
+
+  const text = resolveResultPresentation({ exitCode: 0, elapsed: 5, summary: "done" }, "scout");
+  assert.doesNotMatch(text, /git branch|worktree/);
 });
 
 test("finishWorktree is safe on already-removed paths", { skip: !hasGit() }, () => {

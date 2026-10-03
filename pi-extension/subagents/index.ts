@@ -69,7 +69,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { createWorktree, finishWorktree } from "./worktree.ts";
+import { createWorktree, finishWorktree, worktreeNote } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -698,12 +698,17 @@ function resolveResultPresentation(
     | "sessionId"
     | "errorMessage"
     | "structuredOutputError"
+    | "worktreeNote"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  // Where a worktree subagent's work went. Like schemaNote below: `details`
+  // never reaches the model, so the branch name has to be in the text.
+  const worktreeNote = result.worktreeNote ? `\n\n${result.worktreeNote}` : "";
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -715,7 +720,7 @@ function resolveResultPresentation(
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_message.${sessionRef}`
+      `subagent or resume the session with subagent_message.${worktreeNote}${sessionRef}`
     );
   }
 
@@ -737,8 +742,8 @@ function resolveResultPresentation(
     `--- END SUBAGENT OUTPUT ---`;
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${body}${schemaNote}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${body}${schemaNote}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${body}${schemaNote}${worktreeNote}${sessionRef}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${body}${schemaNote}${worktreeNote}${sessionRef}`;
 }
 
 /**
@@ -766,6 +771,8 @@ interface SubagentResult {
   /** Branch holding the work, if the subagent ran in a worktree. The worktree
    * directory itself is removed on completion; the branch is what survives. */
   worktreeBranch?: string;
+  /** The sentence telling the orchestrator model where that work is. */
+  worktreeNote?: string;
 }
 
 /**
@@ -1540,6 +1547,7 @@ export const __test__ = {
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
+  finishRunningWorktree,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
@@ -2052,6 +2060,14 @@ function structuredFields(
     : { structuredOutputError: extracted.error };
 }
 
+/** Finish a subagent's worktree, if it has one, and say where the work went. */
+function finishRunningWorktree(
+  running: Pick<RunningSubagent, "worktreePath">,
+): Pick<SubagentResult, "worktreeBranch" | "worktreeNote"> {
+  const worktree = running.worktreePath ? finishWorktree(running.worktreePath) : null;
+  return worktree ? { worktreeBranch: worktree.branch, worktreeNote: worktreeNote(worktree) } : {};
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -2134,7 +2150,7 @@ async function watchSubagent(
 
       finishHerdrAgentState(running);
       closeSurface(surface);
-      const worktree = running.worktreePath ? finishWorktree(running.worktreePath) : null;
+      const worktree = finishRunningWorktree(running);
       runningSubagents.delete(running.id);
 
       return {
@@ -2145,7 +2161,7 @@ async function watchSubagent(
         exitCode: result.exitCode,
         elapsed,
         ...(sessionId ? { claudeSessionId: sessionId } : {}),
-        ...(worktree ? { worktreeBranch: worktree.branch } : {}),
+        ...worktree,
       };
     }
 
@@ -2161,7 +2177,7 @@ async function watchSubagent(
 
     finishHerdrAgentState(running);
     closeSurface(surface);
-    const worktree = running.worktreePath ? finishWorktree(running.worktreePath) : null;
+    const worktree = finishRunningWorktree(running);
     runningSubagents.delete(running.id);
 
     return {
@@ -2175,14 +2191,15 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
       ...(summaryIsFinalMessage ? structuredFields(summary, running.outputSchema) : {}),
-      ...(worktree ? { worktreeBranch: worktree.branch } : {}),
+      ...worktree,
     };
   } catch (err: any) {
     try {
       finishHerdrAgentState(running);
       closeSurface(surface);
     } catch {}
-    if (running.worktreePath) finishWorktree(running.worktreePath);
+    // A cancelled or crashed subagent may still have left work behind.
+    const worktree = finishRunningWorktree(running);
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -2194,6 +2211,7 @@ async function watchSubagent(
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
         sessionFile,
+        ...worktree,
       };
     }
     return {
@@ -2203,6 +2221,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      ...worktree,
     };
   }
 }

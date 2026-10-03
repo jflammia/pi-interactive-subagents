@@ -87,7 +87,31 @@ export function createWorktree(repoCwd: string, name: string): string {
  * (a branch ref is ~41 bytes). Add base-comparison work detection if
  * `git branch --list 'pi-subagent/*'` ever gets noisy.
  */
-export function finishWorktree(worktreePath: string): { branch: string; commit?: string } | null {
+export interface WorktreeOutcome {
+  branch: string;
+  /** The save-point commit, when the subagent left uncommitted work. */
+  commit?: string;
+  /** The repo the branch lives in. */
+  repoRoot: string;
+  /** Commits on the branch that the repo's current HEAD does not have —
+   * the save-point commit and anything the subagent committed itself. */
+  ahead: number;
+}
+
+/**
+ * The one line the orchestrator MODEL reads about a finished worktree. The
+ * branch name used to travel only in the tool result's `details`, which pi
+ * never forwards to the model — so the work was saved and then unfindable.
+ */
+export function worktreeNote(outcome: WorktreeOutcome): string {
+  return outcome.ahead > 0
+    ? `Work from this subagent is on git branch \`${outcome.branch}\` in ${outcome.repoRoot} (worktree removed). ` +
+        `Merge or cherry-pick it to use the changes; nothing was applied to your working tree.`
+    : `This subagent ran in a git worktree and left no changes: branch \`${outcome.branch}\` in ${outcome.repoRoot} ` +
+        `has no commits beyond HEAD, so there is nothing to merge (worktree removed).`;
+}
+
+export function finishWorktree(worktreePath: string): WorktreeOutcome | null {
   try {
     const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktreePath });
 
@@ -115,8 +139,11 @@ export function finishWorktree(worktreePath: string): { branch: string; commit?:
       commit = git(["rev-parse", "HEAD"], { cwd: worktreePath });
     }
 
+    // Counted before the remove: if this throws, the worktree is still there.
+    const ahead = Number(git(["rev-list", "--count", `HEAD..${branch}`], { cwd: repoRoot }));
+
     git(["worktree", "remove", "--force", worktreePath], { cwd: repoRoot });
-    return { branch, ...(commit ? { commit } : {}) };
+    return { branch, ...(commit ? { commit } : {}), repoRoot, ahead };
   } catch {
     // Already removed, or path is stale. Cleanup is best-effort; a stale entry
     // can be cleared later with `git worktree prune`.

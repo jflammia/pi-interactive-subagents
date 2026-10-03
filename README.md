@@ -205,8 +205,18 @@ once without colliding. `subagents_parallel({ worktree: true })` applies it to a
 whole batch regardless of what each agent declares.
 
 On completion whatever the agent left uncommitted is committed to that branch
-and the worktree directory is removed — the branch is the handle, and it comes
-back in the result as `worktreeBranch`. Nothing is merged for you.
+and the worktree directory is removed — the branch is the handle. Nothing is
+merged for you. The result the orchestrator reads says where the work is:
+
+```
+Work from this subagent is on git branch `pi-subagent/<name>-<id>` in <repo root> (worktree removed). Merge or cherry-pick it to use the changes; nothing was applied to your working tree.
+```
+
+That line is there on every finished run that had a worktree — completed,
+failed, or cancelled. If the branch has no commits beyond the repo's `HEAD`, it
+says the agent left no changes instead. The branch name is also in the result's
+`details` as `worktreeBranch`, but `details` is for renderers: the model never
+sees it.
 
 A worktree is a fresh checkout, so the agent sees **committed files only**:
 untracked project agents under `.pi/agents/`, `.env` files and `node_modules`
