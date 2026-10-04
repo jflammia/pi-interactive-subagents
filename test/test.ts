@@ -1,3 +1,4 @@
+import "./isolate-agent-dir.ts"; // must stay first: no test may read the real ~/.pi/agent
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -1507,6 +1508,12 @@ describe("subagent discovery", () => {
         `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
     }
+  });
+
+  it("the suite never resolves config from the developer's real agent dir", () => {
+    const agentDir = process.env.PI_CODING_AGENT_DIR;
+    assert.ok(agentDir?.startsWith(tmpdir()), `expected a temp agent dir, got ${agentDir}`);
+    assert.deepEqual(readdirSync(agentDir), [], "the isolated agent dir must start and stay empty");
   });
 
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {

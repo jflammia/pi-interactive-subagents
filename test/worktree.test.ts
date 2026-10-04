@@ -1,3 +1,4 @@
+import "./isolate-agent-dir.ts"; // must stay first: no test may read the real ~/.pi/agent
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
