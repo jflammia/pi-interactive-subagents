@@ -566,11 +566,36 @@ function resolveProviderExtensionSource(source: string): string | undefined {
   }
 }
 
-/** The provider id of a `provider/model` reference; undefined for a bare model id. */
-function modelProviderId(model: string | undefined): string | undefined {
+/**
+ * The provider id of a `provider/model` reference; undefined for a bare model id.
+ *
+ * Provider ids may themselves contain "/", so a known id that prefixes the
+ * reference wins, longest first — the rule pi's own resolver uses
+ * (`splitProviderPrefix`, dist/core/model-resolver.js). Otherwise the text
+ * before the first "/" is the provider.
+ */
+function modelProviderId(model: string | undefined, knownProviderIds: readonly string[] = []): string | undefined {
   if (!model) return undefined;
+  const lower = model.toLowerCase();
+  let best: string | undefined;
+  for (const id of knownProviderIds) {
+    const prefix = id.trim().toLowerCase();
+    if (!prefix || (best && best.length >= id.length)) continue;
+    if (lower.startsWith(`${prefix}/`) && model.length > prefix.length + 1) best = id;
+  }
+  if (best) return best;
   const slash = model.indexOf("/");
   return slash > 0 ? model.slice(0, slash) : undefined;
+}
+
+/**
+ * Provider-extension paths in a loadout snapshot that are no longer on disk.
+ * Resume replays the snapshot; pi only prints an error for a missing `-e` path
+ * and starts without that provider, so the child would fail after its pane
+ * opened. `builtin:` entries are not paths.
+ */
+function missingProviderExtensionPaths(loadout: Pick<SubagentLoadout, "providerExtensions">): string[] {
+  return (loadout.providerExtensions ?? []).filter((p) => !p.startsWith("builtin:") && !existsSync(p));
 }
 
 /**
@@ -591,7 +616,7 @@ function planProviderExtensions(input: {
   map: Record<string, string>;
   resolveSource?: (source: string) => string | undefined;
 }): { paths: string[] } | { error: string } {
-  const provider = modelProviderId(input.model);
+  const provider = modelProviderId(input.model, [...Object.keys(input.map), ...input.extensionProviderIds]);
   if (!input.restricted || !provider) return { paths: [] };
   const source = input.map[provider];
   if (source !== undefined) {
@@ -1673,6 +1698,8 @@ export const __test__ = {
   resolveProviderExtensionSource,
   planProviderExtensions,
   providerExtensionPlanFor,
+  modelProviderId,
+  missingProviderExtensionPaths,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
@@ -2901,6 +2928,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // Refuse before a pane exists when the snapshot names a provider
+        // extension that has since been removed.
+        const missingProviderPaths = missingProviderExtensionPaths(loadout);
+        if (missingProviderPaths.length > 0) {
+          const err =
+            `Cannot resume "${requestedName}": its model's provider extension is no longer installed ` +
+            `(${missingProviderPaths.join(", ")}). Reinstall it, or re-run the task as a fresh subagent.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 

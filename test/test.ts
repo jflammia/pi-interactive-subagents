@@ -1602,6 +1602,66 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("launchSubagent refuses an unmapped extension provider before it creates a pane", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "ro", "name: ro\ntools: read\nmodel: cc/m");
+      const ctx = {
+        cwd: process.cwd(),
+        modelRegistry: { getRegisteredProviderIds: () => ["cc"] },
+        sessionManager: {
+          getSessionFile: () => {
+            throw new Error("reached session setup");
+          },
+          getSessionId: () => "s",
+          getSessionDir: () => process.cwd(),
+        },
+      };
+      // The provider refusal must come first: nothing after it (session file,
+      // worktree, herdr pane) may run for a spawn that cannot work.
+      await assert.rejects(
+        testApi.launchSubagent({ agent: "ro", task: "T", name: "ro" }, ctx),
+        /provider "cc", which an extension registers/,
+      );
+    });
+  });
+
+  it("modelProviderId matches a known provider id that contains '/', longest first", () => {
+    assert.equal(testApi.modelProviderId("claude-code/claude-sonnet-5-5"), "claude-code");
+    assert.equal(testApi.modelProviderId("claude-sonnet-5-5"), undefined, "a bare id names no provider");
+    assert.equal(testApi.modelProviderId(undefined), undefined);
+    // Without the known id, the first segment would be taken as the provider.
+    assert.equal(testApi.modelProviderId("corp/proxy/model-x"), "corp");
+    assert.equal(testApi.modelProviderId("corp/proxy/model-x", ["corp", "corp/proxy"]), "corp/proxy");
+    assert.equal(testApi.modelProviderId("Corp/Proxy/model-x", ["corp/proxy"]), "corp/proxy", "case-insensitive");
+    // A known id with nothing after the slash is not a model reference.
+    assert.equal(testApi.modelProviderId("corp/proxy/", ["corp/proxy"]), "corp");
+  });
+
+  it("planProviderExtensions maps a provider id that contains '/'", () => {
+    const plan = testApi.planProviderExtensions({
+      model: "corp/proxy/model-x",
+      restricted: true,
+      extensionProviderIds: [],
+      map: { "corp/proxy": "git:example.com/corp/pi-proxy" },
+      resolveSource: () => "/pkgs/pi-proxy",
+    });
+    assert.deepEqual(plan, { paths: ["/pkgs/pi-proxy"] });
+  });
+
+  it("missingProviderExtensionPaths reports snapshot paths that are gone, never builtins", () => {
+    withTempDir((d) => {
+      const present = join(d, "pi-claude-code");
+      mkdirSync(present);
+      const gone = join(d, "removed-provider");
+      assert.deepEqual(
+        testApi.missingProviderExtensionPaths({ providerExtensions: [present, gone, "builtin:llama.cpp"] }),
+        [gone],
+      );
+      assert.deepEqual(testApi.missingProviderExtensionPaths({}), [], "older snapshot without the field");
+      assert.deepEqual(testApi.missingProviderExtensionPaths({ providerExtensions: null }), []);
+    });
+  });
+
   it("resolveProviderExtensionSource resolves through pi's package manager", async () => {
     await withIsolatedAgentEnv(async ({ globalDir }) => {
       const installed = join(globalDir, "git", "github.com", "example", "pi-provider");

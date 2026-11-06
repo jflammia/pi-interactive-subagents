@@ -258,11 +258,11 @@ Extensions can register additional tools for sub-agents at runtime via `register
 }
 ```
 
-- The value is a pi package source or path, resolved through pi's package manager to where pi installed it, or a `builtin:<name>` extension. It is not installed for you.
-- It applies to whichever model the spawn resolves to (the `model` param, `subagents.agentOverrides`, or frontmatter), only for restricted pi sub-agents. Unrestricted spawns and `cli:` runners already have their providers.
-- The extension adds a provider, not tools: `--tools` still bounds what the child can call. Load only providers you trust, since the extension runs in the child.
-- A model whose provider an extension registers, with no mapping, is refused at spawn with the fix in the message. So is a mapping that is not installed.
-- The resolved path is part of the loadout snapshot, so resume loads the same provider.
+- The value is a pi package source, resolved with pi's `DefaultPackageManager.getInstalledPath(source, "user")`, or a `builtin:<name>` extension. The package must be installed at **user** scope (`pi install <source>`, not `-l`); a local path is relative to the agent dir. It is not installed for you.
+- It applies to whichever model the spawn resolves to (the `model` param, `subagents.agentOverrides`, or frontmatter), only for restricted pi sub-agents, and only to `provider/model` references. A bare model id names no provider and is passed through unchanged. Unrestricted spawns and `cli:` runners already have their providers.
+- `--tools` still bounds every tool the child can call, the extension's included, and with `--no-extensions` pi's built-in MCP support is off, so an MCP server the extension registers never connects. The extension's own code (event handlers, commands) does run in the child: map only providers you trust.
+- Refused at spawn, before a pane exists, with the fix in the message: a `provider/model` whose provider this pi process reports as registered by an extension (`modelRegistry.getRegisteredProviderIds()`) but has no mapping, and a mapping that is not installed. A provider this process never loaded is not detected; the child then fails with "model not found".
+- The resolved path is part of the loadout snapshot, so resume loads the same provider. Resume is refused, before a pane exists, if that path is gone.
 
 ## Role folders
 
