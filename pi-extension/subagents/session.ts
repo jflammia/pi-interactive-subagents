@@ -220,6 +220,12 @@ export interface SubagentLoadout {
   worktree: boolean;
   /** CLI runner: "pi" (default) or "claude". */
   cli: string | null;
+  /**
+   * Resolved `-e` paths of the extensions that register the model's provider
+   * (`subagents.providerExtensions`), loaded despite `--no-extensions`. Absent
+   * in snapshots written before this field existed, which loaded none.
+   */
+  providerExtensions?: string[] | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

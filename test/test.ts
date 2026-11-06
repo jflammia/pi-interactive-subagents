@@ -1481,6 +1481,240 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loadSubagentProviderExtensions reads the provider → package map", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      assert.deepEqual(testApi.loadSubagentProviderExtensions(), {}, "no settings file");
+      writeSettingsFile(globalDir, {
+        subagents: {
+          providerExtensions: {
+            "claude-code": " git:github.com/earendil-works/pi-claude-code ",
+            "llama.cpp": "builtin:llama.cpp",
+            // Dropped: nothing a child could load.
+            empty: "",
+            blank: "   ",
+            numeric: 42,
+            object: { source: "x" },
+            nil: null,
+          },
+        },
+      });
+      assert.deepEqual(testApi.loadSubagentProviderExtensions(), {
+        "claude-code": "git:github.com/earendil-works/pi-claude-code",
+        "llama.cpp": "builtin:llama.cpp",
+      });
+    });
+  });
+
+  it("loadSubagentProviderExtensions survives a settings.json it cannot use", async () => {
+    const unusable: Array<[string, unknown]> = [
+      ["malformed JSON", "{ not json"],
+      ["JSON null", "null"],
+      ["no subagents key", { other: true }],
+      ["a string map", { subagents: { providerExtensions: "claude-code" } }],
+      ["an array map", { subagents: { providerExtensions: ["claude-code"] } }],
+      ["a null map", { subagents: { providerExtensions: null } }],
+    ];
+    for (const [label, contents] of unusable) {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeSettingsFile(globalDir, contents);
+        assert.deepEqual(testApi.loadSubagentProviderExtensions(), {}, label);
+      });
+    }
+  });
+
+  it("planProviderExtensions loads a mapped provider's extension into a restricted child", () => {
+    const plan = testApi.planProviderExtensions({
+      model: "claude-code/claude-sonnet-5-5",
+      restricted: true,
+      extensionProviderIds: ["claude-code"],
+      map: { "claude-code": "git:github.com/earendil-works/pi-claude-code" },
+      resolveSource: (s: string) => (s.includes("pi-claude-code") ? "/pkgs/pi-claude-code" : undefined),
+    });
+    assert.deepEqual(plan, { paths: ["/pkgs/pi-claude-code"] });
+  });
+
+  it("planProviderExtensions refuses an extension-registered provider with no mapping", () => {
+    // Under --no-extensions the child exits "model not found" with nothing in
+    // the result saying why. Refuse before a pane exists, and say how to fix it.
+    const plan = testApi.planProviderExtensions({
+      model: "claude-code/claude-sonnet-5-5",
+      restricted: true,
+      extensionProviderIds: ["claude-code"],
+      map: {},
+    });
+    assert.ok("error" in plan);
+    assert.match(plan.error, /provider "claude-code", which an extension registers/);
+    assert.match(plan.error, /providerExtensions/);
+  });
+
+  it("planProviderExtensions refuses a mapping that is not installed", () => {
+    const plan = testApi.planProviderExtensions({
+      model: "claude-code/claude-sonnet-5-5",
+      restricted: true,
+      extensionProviderIds: [],
+      map: { "claude-code": "git:github.com/nobody/nothing" },
+      resolveSource: () => undefined,
+    });
+    assert.ok("error" in plan);
+    assert.match(plan.error, /not installed/);
+    assert.match(plan.error, /pi install git:github\.com\/nobody\/nothing/);
+  });
+
+  it("planProviderExtensions adds nothing when the child keeps every extension or the provider is built in", () => {
+    const map = { "claude-code": "git:github.com/earendil-works/pi-claude-code" };
+    const resolveSource = () => {
+      throw new Error("must not resolve");
+    };
+    // Unrestricted child: no --no-extensions, so the provider already loads.
+    assert.deepEqual(
+      testApi.planProviderExtensions({
+        model: "claude-code/claude-sonnet-5-5",
+        restricted: false,
+        extensionProviderIds: ["claude-code"],
+        map,
+        resolveSource,
+      }),
+      { paths: [] },
+    );
+    // Built-in provider, unmapped: nothing to load and nothing to refuse.
+    assert.deepEqual(
+      testApi.planProviderExtensions({
+        model: "openrouter/z-ai/glm-5.3",
+        restricted: true,
+        extensionProviderIds: ["claude-code"],
+        map,
+        resolveSource,
+      }),
+      { paths: [] },
+    );
+    // No model, or a bare id with no provider prefix: the session default applies.
+    for (const model of [undefined, "glm-5.3"]) {
+      assert.deepEqual(
+        testApi.planProviderExtensions({
+          model,
+          restricted: true,
+          extensionProviderIds: ["claude-code"],
+          map,
+          resolveSource,
+        }),
+        { paths: [] },
+      );
+    }
+  });
+
+  it("launchSubagent refuses an unmapped extension provider before it creates a pane", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "ro", "name: ro\ntools: read\nmodel: cc/m");
+      const ctx = {
+        cwd: process.cwd(),
+        modelRegistry: { getRegisteredProviderIds: () => ["cc"] },
+        sessionManager: {
+          getSessionFile: () => {
+            throw new Error("reached session setup");
+          },
+          getSessionId: () => "s",
+          getSessionDir: () => process.cwd(),
+        },
+      };
+      // The provider refusal must come first: nothing after it (session file,
+      // worktree, herdr pane) may run for a spawn that cannot work.
+      await assert.rejects(
+        testApi.launchSubagent({ agent: "ro", task: "T", name: "ro" }, ctx),
+        /provider "cc", which an extension registers/,
+      );
+    });
+  });
+
+  it("modelProviderId matches a known provider id that contains '/', longest first", () => {
+    assert.equal(testApi.modelProviderId("claude-code/claude-sonnet-5-5"), "claude-code");
+    assert.equal(testApi.modelProviderId("claude-sonnet-5-5"), undefined, "a bare id names no provider");
+    assert.equal(testApi.modelProviderId(undefined), undefined);
+    // Without the known id, the first segment would be taken as the provider.
+    assert.equal(testApi.modelProviderId("corp/proxy/model-x"), "corp");
+    assert.equal(testApi.modelProviderId("corp/proxy/model-x", ["corp", "corp/proxy"]), "corp/proxy");
+    assert.equal(testApi.modelProviderId("Corp/Proxy/model-x", ["corp/proxy"]), "corp/proxy", "case-insensitive");
+    // A known id with nothing after the slash is not a model reference.
+    assert.equal(testApi.modelProviderId("corp/proxy/", ["corp/proxy"]), "corp");
+  });
+
+  it("planProviderExtensions maps a provider id that contains '/'", () => {
+    const plan = testApi.planProviderExtensions({
+      model: "corp/proxy/model-x",
+      restricted: true,
+      extensionProviderIds: [],
+      map: { "corp/proxy": "git:example.com/corp/pi-proxy" },
+      resolveSource: () => "/pkgs/pi-proxy",
+    });
+    assert.deepEqual(plan, { paths: ["/pkgs/pi-proxy"] });
+  });
+
+  it("missingProviderExtensionPaths reports snapshot paths that are gone, never builtins", () => {
+    withTempDir((d) => {
+      const present = join(d, "pi-claude-code");
+      mkdirSync(present);
+      const gone = join(d, "removed-provider");
+      assert.deepEqual(
+        testApi.missingProviderExtensionPaths({ providerExtensions: [present, gone, "builtin:llama.cpp"] }),
+        [gone],
+      );
+      assert.deepEqual(testApi.missingProviderExtensionPaths({}), [], "older snapshot without the field");
+      assert.deepEqual(testApi.missingProviderExtensionPaths({ providerExtensions: null }), []);
+    });
+  });
+
+  it("resolveProviderExtensionSource resolves through pi's package manager", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const installed = join(globalDir, "git", "github.com", "example", "pi-provider");
+      mkdirSync(installed, { recursive: true });
+      assert.equal(
+        testApi.resolveProviderExtensionSource("git:github.com/example/pi-provider"),
+        installed,
+      );
+      // A pinned ref resolves to the same managed checkout.
+      assert.equal(
+        testApi.resolveProviderExtensionSource("git:github.com/example/pi-provider@abc1234"),
+        installed,
+      );
+      assert.equal(testApi.resolveProviderExtensionSource("git:github.com/example/missing"), undefined);
+      assert.equal(testApi.resolveProviderExtensionSource("builtin:llama.cpp"), "builtin:llama.cpp");
+    });
+  });
+
+  it("providerExtensionPlanFor uses the spawn's resolved model and restriction", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const installed = join(globalDir, "git", "github.com", "example", "pi-provider");
+      mkdirSync(installed, { recursive: true });
+      writeSettingsFile(globalDir, {
+        subagents: { providerExtensions: { cc: "git:github.com/example/pi-provider" } },
+      });
+      const ctx = { modelRegistry: { getRegisteredProviderIds: () => ["cc", "other"] } };
+      const restricted = { tools: "read" };
+
+      // A spawn-time model override is planned, not just the frontmatter model.
+      assert.deepEqual(
+        testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "cc/m" }, restricted, ctx),
+        { paths: [installed] },
+      );
+      // Unmapped extension provider: refused.
+      assert.ok("error" in testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "other/m" }, restricted, ctx));
+      // No tools: line → unrestricted child → nothing to add.
+      assert.deepEqual(
+        testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "other/m" }, {}, ctx),
+        { paths: [] },
+      );
+      // cli: runners are outside pi's sandbox.
+      assert.deepEqual(
+        testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "other/m" }, { cli: "claude" }, ctx),
+        { paths: [] },
+      );
+      // A ctx without a model registry cannot detect anything; the mapping still applies.
+      assert.deepEqual(
+        testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "cc/m" }, restricted, {}),
+        { paths: [installed] },
+      );
+    });
+  });
+
   it("resolveEffectiveModelAndThinking falls back cleanly with no settings file", async () => {
     await withIsolatedAgentEnv(async () => {
       assert.deepEqual(
@@ -1698,6 +1932,58 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applySandboxToParts loads provider extensions next to the tool-backing ones", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "reviewer",
+          toolAllowlist: "read,grep",
+          model: "claude-code/claude-sonnet-5-5",
+          thinking: "high",
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+          providerExtensions: ["/pkgs/pi-claude-code"],
+        },
+        { artifactDir: d, name: "reviewer" },
+      );
+      assert.ok(parts.includes("--no-extensions"), "the default-deny restriction stays");
+      const toolsIdx = parts.indexOf("--tools");
+      assert.ok(parts[toolsIdx + 1].includes("read,grep"), "the tool allowlist is unchanged");
+      const eIdx = parts.indexOf("-e");
+      assert.ok(eIdx > toolsIdx, "expected -e after --tools");
+      assert.ok(parts[eIdx + 1].includes("/pkgs/pi-claude-code"), "expected the provider extension");
+    });
+  });
+
+  it("applySandboxToParts loads no provider extension for an older snapshot without the field", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "reviewer",
+          toolAllowlist: "read",
+          model: "openrouter/z-ai/glm-5.3",
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "reviewer" },
+      );
+      assert.equal(parts.includes("-e"), false);
     });
   });
 
@@ -4258,6 +4544,19 @@ describe("gaps the mutation sweep exposed", () => {
     assert.equal(testApi.findBatchSpawnProblem([{ agent: "good" }], load), null);
     assert.equal(testApi.findBatchSpawnProblem([{ agent: "claudeok" }], load), null);
     assert.equal(testApi.findBatchSpawnProblem([], load), null);
+
+    // A provider that would leave the child without its model is caught before
+    // any task launches, and the task's own model override is what is planned.
+    const seen: Array<string | undefined> = [];
+    const plan = (p: { model?: string }) => {
+      seen.push(p.model);
+      return p.model === "cc/m" ? { error: "provider cc unmapped" } : { paths: [] };
+    };
+    assert.match(
+      testApi.findBatchSpawnProblem([{ agent: "good" }, { agent: "good", model: "cc/m" }], load, plan) ?? "",
+      /Agent "good": provider cc unmapped/,
+    );
+    assert.deepEqual(seen, [undefined, "cc/m"]);
 
     assert.match(
       testApi.findBatchSpawnProblem([{ agent: "good" }, { agent: "blocky" }], load) ?? "",

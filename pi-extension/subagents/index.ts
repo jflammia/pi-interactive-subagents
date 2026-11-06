@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, keyHint, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
@@ -512,6 +512,168 @@ function loadSubagentAgentOverrides(): Record<string, { model?: string; thinking
     if (entry.model || entry.thinking) result[name] = entry;
   }
   return result;
+}
+
+/**
+ * Read `subagents.providerExtensions` from the pi settings file: a map from a
+ * provider id to the pi package source (or path) of the extension that
+ * registers it, e.g. `{ "claude-code": "git:github.com/earendil-works/pi-claude-code" }`.
+ *
+ * A restricted subagent runs `--no-extensions`, so a provider that only exists
+ * because an extension registered it is absent from the child. This map is the
+ * declared exception: the named extension is loaded back with `-e`, the same
+ * way tool-backing extensions are. Entries that are not non-empty strings are
+ * dropped; a malformed file yields `{}`, never a throw.
+ */
+function loadSubagentProviderExtensions(): Record<string, string> {
+  const settingsPath = join(getAgentConfigDir(), "settings.json");
+  if (!existsSync(settingsPath)) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as unknown;
+  } catch {
+    return {};
+  }
+  const subagents = (parsed as { subagents?: unknown } | null)?.subagents;
+  const map = (subagents as { providerExtensions?: unknown } | null)?.providerExtensions;
+  if (!map || typeof map !== "object" || Array.isArray(map)) return {};
+  const result: Record<string, string> = {};
+  for (const [provider, source] of Object.entries(map as Record<string, unknown>)) {
+    if (!provider.trim() || typeof source !== "string" || !source.trim()) continue;
+    result[provider] = source.trim();
+  }
+  return result;
+}
+
+/**
+ * Resolve a `providerExtensions` value to what `pi -e` accepts. `builtin:<name>`
+ * passes through (pi resolves it); anything else is a package source or path,
+ * resolved through pi's own package manager to the user-scope install path —
+ * the same location pi itself loads that package from. Undefined when it is not
+ * installed.
+ */
+function resolveProviderExtensionSource(source: string): string | undefined {
+  if (source.startsWith("builtin:")) return source;
+  try {
+    const packageManager = new DefaultPackageManager({
+      cwd: process.cwd(),
+      agentDir: getAgentConfigDir(),
+      settingsManager: SettingsManager.inMemory(),
+    });
+    return packageManager.getInstalledPath(source, "user");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The provider id of a `provider/model` reference; undefined for a bare model id.
+ *
+ * Provider ids may themselves contain "/", so a known id that prefixes the
+ * reference wins, longest first — the rule pi's own resolver uses
+ * (`splitProviderPrefix`, dist/core/model-resolver.js). Otherwise the text
+ * before the first "/" is the provider.
+ */
+function modelProviderId(model: string | undefined, knownProviderIds: readonly string[] = []): string | undefined {
+  if (!model) return undefined;
+  const lower = model.toLowerCase();
+  let best: string | undefined;
+  for (const id of knownProviderIds) {
+    const prefix = id.trim().toLowerCase();
+    if (!prefix || (best && best.length >= id.length)) continue;
+    if (lower.startsWith(`${prefix}/`) && model.length > prefix.length + 1) best = id;
+  }
+  if (best) return best;
+  const slash = model.indexOf("/");
+  return slash > 0 ? model.slice(0, slash) : undefined;
+}
+
+/**
+ * Provider-extension paths in a loadout snapshot that are no longer on disk.
+ * Resume replays the snapshot; pi only prints an error for a missing `-e` path
+ * and starts without that provider, so the child would fail after its pane
+ * opened. `builtin:` entries are not paths.
+ */
+function missingProviderExtensionPaths(loadout: Pick<SubagentLoadout, "providerExtensions">): string[] {
+  return (loadout.providerExtensions ?? []).filter((p) => !p.startsWith("builtin:") && !existsSync(p));
+}
+
+/**
+ * Decide which provider extensions a pi subagent must load, or why it cannot
+ * launch.
+ *
+ * - Unrestricted spawns keep every extension, so nothing is added.
+ * - A provider mapped in `providerExtensions` is loaded back with `-e`; a
+ *   mapping that does not resolve is refused rather than launched broken.
+ * - A provider the parent knows was registered by an extension, but which has
+ *   no mapping, is refused: under `--no-extensions` the child would exit with
+ *   "model not found" and nothing in the result would say why.
+ */
+function planProviderExtensions(input: {
+  model: string | undefined;
+  restricted: boolean;
+  extensionProviderIds: readonly string[];
+  map: Record<string, string>;
+  resolveSource?: (source: string) => string | undefined;
+}): { paths: string[] } | { error: string } {
+  const provider = modelProviderId(input.model, [...Object.keys(input.map), ...input.extensionProviderIds]);
+  if (!input.restricted || !provider) return { paths: [] };
+  const source = input.map[provider];
+  if (source !== undefined) {
+    const path = (input.resolveSource ?? resolveProviderExtensionSource)(source);
+    if (!path) {
+      return {
+        error:
+          `Model "${input.model}" needs provider "${provider}", which subagents.providerExtensions ` +
+          `maps to "${source}" — but that is not installed. Install it with \`pi install ${source}\`, ` +
+          `or fix the mapping in settings.json.`,
+      };
+    }
+    return { paths: [path] };
+  }
+  if (input.extensionProviderIds.includes(provider)) {
+    return {
+      error:
+        `Model "${input.model}" uses provider "${provider}", which an extension registers. ` +
+        `Restricted subagents run with --no-extensions, so the child could not find it. ` +
+        `Map the provider to its package in settings.json: ` +
+        `{"subagents": {"providerExtensions": {"${provider}": "<package source>"}}}.`,
+    };
+  }
+  return { paths: [] };
+}
+
+/**
+ * The provider-extension plan for one pi spawn, from the same inputs the launch
+ * uses: the resolved model and whether the child is restricted. `cli:` runners
+ * are outside pi's sandbox and need nothing.
+ */
+function providerExtensionPlanFor(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  ctx: unknown,
+): { paths: string[] } | { error: string } {
+  if (agentDefs?.cli && agentDefs.cli !== "pi") return { paths: [] };
+  const { model } = resolveEffectiveModelAndThinking(params, agentDefs);
+  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  const restricted = buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning }) !== null;
+  return planProviderExtensions({
+    model,
+    restricted,
+    extensionProviderIds: extensionProviderIdsOf(ctx),
+    map: restricted ? loadSubagentProviderExtensions() : {},
+  });
+}
+
+/** Provider ids registered by extensions in this pi process (empty when unknown). */
+function extensionProviderIdsOf(ctx: unknown): readonly string[] {
+  const registry = (ctx as { modelRegistry?: { getRegisteredProviderIds?: () => readonly string[] } } | null)
+    ?.modelRegistry;
+  try {
+    return registry?.getRegisteredProviderIds?.() ?? [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -1059,6 +1221,11 @@ function applySandboxToParts(
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
+    // The extension that registers the model's provider. It adds a provider,
+    // not tools: `--tools` still bounds what the child can call.
+    for (const extPath of loadout.providerExtensions ?? []) {
+      extPaths.add(extPath);
+    }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
@@ -1361,8 +1528,12 @@ function startStatusRefresh(pi: ExtensionAPI) {
  * throw inside launchSubagent has to be caught here first.
  */
 function findBatchSpawnProblem(
-  tasks: Array<{ agent: string }>,
+  tasks: Array<{ agent: string; model?: string }>,
   loadDefs: (agent: string) => AgentDefaults | null = loadAgentDefaults,
+  planFor: (
+    params: Static<typeof SubagentParams>,
+    defs: AgentDefaults | null,
+  ) => { paths: string[] } | { error: string } = () => ({ paths: [] }),
 ): string | null {
   for (const task of tasks) {
     const defs = loadDefs(task.agent);
@@ -1385,6 +1556,8 @@ function findBatchSpawnProblem(
         return `Agent "${task.agent}": ${err?.message ?? String(err)}`;
       }
     }
+    const plan = planFor({ agent: task.agent, task: "", model: task.model }, defs);
+    if ("error" in plan) return `Agent "${task.agent}": ${plan.error}`;
   }
   return null;
 }
@@ -1521,6 +1694,12 @@ export const __test__ = {
   resolveEffectiveInteractive,
   loadSubagentAgentOverrides,
   resolveEffectiveModelAndThinking,
+  loadSubagentProviderExtensions,
+  resolveProviderExtensionSource,
+  planProviderExtensions,
+  providerExtensionPlanFor,
+  modelProviderId,
+  missingProviderExtensionPaths,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
@@ -1632,6 +1811,8 @@ async function launchSubagentInner(
     );
   }
   assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
+  const providerPlan = providerExtensionPlanFor(params, agentDefs, ctx);
+  if ("error" in providerPlan) throw new Error(providerPlan.error);
   const effectiveSkills = agentDefs?.skills;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
@@ -1826,6 +2007,7 @@ async function launchSubagentInner(
     outputSchema: agentDefs?.outputSchema ?? null,
     worktree: agentDefs?.worktree ?? false,
     cli: agentDefs?.cli ?? null,
+    providerExtensions: providerPlan.paths.length > 0 ? providerPlan.paths : null,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -2749,6 +2931,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        // Refuse before a pane exists when the snapshot names a provider
+        // extension that has since been removed.
+        const missingProviderPaths = missingProviderExtensionPaths(loadout);
+        if (missingProviderPaths.length > 0) {
+          const err =
+            `Cannot resume "${requestedName}": its model's provider extension is no longer installed ` +
+            `(${missingProviderPaths.join(", ")}). Reinstall it, or re-run the task as a fresh subagent.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
         // Record entry count before resuming so we can extract new messages.
@@ -3015,7 +3207,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        const batchProblem = findBatchSpawnProblem(params.tasks);
+        const batchProblem = findBatchSpawnProblem(params.tasks, loadAgentDefaults, (p, defs) =>
+          providerExtensionPlanFor(p, defs, ctx),
+        );
         if (batchProblem) {
           return {
             content: [{ type: "text" as const, text: batchProblem }],

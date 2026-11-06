@@ -104,7 +104,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
+| `model` | string | agent's model | Override the model for this spawn. A provider registered by an extension needs a [`providerExtensions`](#models-from-extension-providers) entry |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
 ### Messaging
@@ -243,6 +243,26 @@ Access is **whitelist-only**. Every **pi** sub-agent process is launched with `-
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
 Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+
+### Models from extension providers
+
+`--no-extensions` also unloads providers that an extension registers (for example `claude-code`, from [pi-claude-code](https://github.com/earendil-works/pi-claude-code)). A restricted sub-agent asked to use such a model would exit with "model not found", so the provider's extension is declared in `settings.json` and loaded back with `-e`, the same way tool-backing extensions are:
+
+```json
+{
+  "subagents": {
+    "providerExtensions": {
+      "claude-code": "git:github.com/earendil-works/pi-claude-code"
+    }
+  }
+}
+```
+
+- The value is a pi package source, resolved with pi's `DefaultPackageManager.getInstalledPath(source, "user")`, or a `builtin:<name>` extension. The package must be installed at **user** scope (`pi install <source>`, not `-l`); a local path is relative to the agent dir. It is not installed for you.
+- It applies to whichever model the spawn resolves to (the `model` param, `subagents.agentOverrides`, or frontmatter), only for restricted pi sub-agents, and only to `provider/model` references. A bare model id names no provider and is passed through unchanged. Unrestricted spawns and `cli:` runners already have their providers.
+- `--tools` still bounds every tool the child can call, the extension's included, and with `--no-extensions` pi's built-in MCP support is off, so an MCP server the extension registers never connects. The extension's own code (event handlers, commands) does run in the child: map only providers you trust.
+- Refused at spawn, before a pane exists, with the fix in the message: a `provider/model` whose provider this pi process reports as registered by an extension (`modelRegistry.getRegisteredProviderIds()`) but has no mapping, and a mapping that is not installed. A provider this process never loaded is not detected; the child then fails with "model not found".
+- The resolved path is part of the loadout snapshot, so resume loads the same provider. Resume is refused, before a pane exists, if that path is gone.
 
 ## Role folders
 
