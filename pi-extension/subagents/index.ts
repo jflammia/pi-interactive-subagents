@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DefaultPackageManager, keyHint, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { Type, type Static } from "typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
@@ -605,9 +606,12 @@ function missingProviderExtensionPaths(loadout: Pick<SubagentLoadout, "providerE
  * - Unrestricted spawns keep every extension, so nothing is added.
  * - A provider mapped in `providerExtensions` is loaded back with `-e`; a
  *   mapping that does not resolve is refused rather than launched broken.
- * - A provider the parent knows was registered by an extension, but which has
- *   no mapping, is refused: under `--no-extensions` the child would exit with
- *   "model not found" and nothing in the result would say why.
+ * - A Pi built-in provider (pi-ai `getBuiltinProviders()`) needs nothing, even
+ *   when an extension re-registers it in the parent (a filter or wrapper): the
+ *   child resolves Pi's own provider. Map it to load the extension anyway.
+ * - Any other provider the parent knows was registered by an extension, but
+ *   which has no mapping, is refused: under `--no-extensions` the child would
+ *   exit with "model not found" and nothing in the result would say why.
  */
 function planProviderExtensions(input: {
   model: string | undefined;
@@ -615,6 +619,7 @@ function planProviderExtensions(input: {
   extensionProviderIds: readonly string[];
   map: Record<string, string>;
   resolveSource?: (source: string) => string | undefined;
+  builtinProviderIds?: readonly string[];
 }): { paths: string[] } | { error: string } {
   const provider = modelProviderId(input.model, [...Object.keys(input.map), ...input.extensionProviderIds]);
   if (!input.restricted || !provider) return { paths: [] };
@@ -631,7 +636,8 @@ function planProviderExtensions(input: {
     }
     return { paths: [path] };
   }
-  if (input.extensionProviderIds.includes(provider)) {
+  const builtin = (input.builtinProviderIds ?? getBuiltinProviders()).includes(provider);
+  if (input.extensionProviderIds.includes(provider) && !builtin) {
     return {
       error:
         `Model "${input.model}" uses provider "${provider}", which an extension registers. ` +

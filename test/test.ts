@@ -1547,6 +1547,53 @@ describe("subagent discovery", () => {
     assert.match(plan.error, /providerExtensions/);
   });
 
+  it("planProviderExtensions passes through a built-in provider an extension re-registers", () => {
+    // A filter/wrapper extension (pi.registerProvider over a built-in) puts the
+    // id in getRegisteredProviderIds(); the child still has Pi's own provider.
+    const builtinProviderIds = ["openrouter"];
+    assert.deepEqual(
+      testApi.planProviderExtensions({
+        model: "openrouter/qwen/qwen3.7-flash",
+        restricted: true,
+        extensionProviderIds: ["openrouter"],
+        map: {},
+        builtinProviderIds,
+      }),
+      { paths: [] },
+    );
+    // A mapping still loads the extension into the child.
+    assert.deepEqual(
+      testApi.planProviderExtensions({
+        model: "openrouter/qwen/qwen3.7-flash",
+        restricted: true,
+        extensionProviderIds: ["openrouter"],
+        map: { openrouter: "git:example/wrapper" },
+        resolveSource: () => "/pkgs/wrapper",
+        builtinProviderIds,
+      }),
+      { paths: ["/pkgs/wrapper"] },
+    );
+    // The default list is pi-ai's catalog: openrouter is in it, claude-code is not.
+    assert.deepEqual(
+      testApi.planProviderExtensions({
+        model: "openrouter/qwen/qwen3.7-flash",
+        restricted: true,
+        extensionProviderIds: ["openrouter", "claude-code"],
+        map: {},
+      }),
+      { paths: [] },
+    );
+    assert.ok(
+      "error" in
+        testApi.planProviderExtensions({
+          model: "claude-code/claude-sonnet-5-5",
+          restricted: true,
+          extensionProviderIds: ["openrouter", "claude-code"],
+          map: {},
+        }),
+    );
+  });
+
   it("planProviderExtensions refuses a mapping that is not installed", () => {
     const plan = testApi.planProviderExtensions({
       model: "claude-code/claude-sonnet-5-5",
