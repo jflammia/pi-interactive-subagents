@@ -1617,11 +1617,18 @@ describe("subagent discovery", () => {
       // the paths its parent resolved still apply.
       writeSettingsFile(globalDir, {});
       const before = process.env.PI_SUBAGENT_POLICY_EXTENSIONS;
-      process.env.PI_SUBAGENT_POLICY_EXTENSIONS = JSON.stringify(["/pkgs/gate-a", "/pkgs/gate-b"]);
+      const { mkdtempSync, mkdirSync } = await import("node:fs");
+      const root = mkdtempSync(join(tmpdir(), "policy-"));
+      const gateA = join(root, "gate-a"); const gateB = join(root, "gate-b");
+      mkdirSync(gateA); mkdirSync(gateB);
+      process.env.PI_SUBAGENT_POLICY_EXTENSIONS = JSON.stringify([gateA, gateB]);
       try {
-        assert.deepEqual(testApi.policyExtensionPlanFor({ tools: "read" }), { paths: ["/pkgs/gate-a", "/pkgs/gate-b"] });
+        assert.deepEqual(testApi.policyExtensionPlanFor({ tools: "read" }), { paths: [gateA, gateB] });
         // Unrestricted children get them too: they may run with a target-local agent dir.
-        assert.deepEqual(testApi.policyExtensionPlanFor(null), { paths: ["/pkgs/gate-a", "/pkgs/gate-b"] });
+        assert.deepEqual(testApi.policyExtensionPlanFor(null), { paths: [gateA, gateB] });
+        process.env.PI_SUBAGENT_POLICY_EXTENSIONS = JSON.stringify(["/nonexistent/gate"]);
+        const gone = testApi.policyExtensionPlanFor({ tools: "read" });
+        assert.ok("error" in gone && /no longer installed/.test(gone.error), "a removed inherited path refuses");
         process.env.PI_SUBAGENT_POLICY_EXTENSIONS = "not json";
         const bad = testApi.policyExtensionPlanFor({ tools: "read" });
         assert.ok("error" in bad, "an unreadable inherited list refuses");

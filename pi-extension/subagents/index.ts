@@ -773,6 +773,11 @@ function policyExtensionPlanFor(agentDefs: AgentDefaults | null): { paths: strin
   // it already loads from settings (resource-loader mergePaths).
   const plan = planPolicyExtensions({ restricted: true, sources });
   if ("error" in plan) return plan;
+  // A path inherited from the parent must still exist: pi starts without a missing -e path.
+  const gone = inherited.filter((p) => !p.startsWith("builtin:") && !existsSync(p));
+  if (gone.length > 0) {
+    return { error: `a policy extension this subagent's parent loaded is no longer installed (${gone.join(", ")}), so the child would run without it.` };
+  }
   return { paths: [...new Set([...inherited, ...plan.paths])] };
 }
 
