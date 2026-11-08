@@ -746,7 +746,6 @@ function providerExtensionPlanFor(
   agentDefs: AgentDefaults | null,
   ctx: unknown,
 ): { paths: string[] } | { error: string } {
-  if (agentDefs?.cli && agentDefs.cli !== "pi") return { paths: [] };
   const { model } = resolveEffectiveModelAndThinking(params, agentDefs);
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const restricted = buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning }) !== null;
@@ -763,7 +762,6 @@ function providerExtensionPlanFor(
  * entry for a restricted child; nothing for an unrestricted one or a `cli:` runner.
  */
 function policyExtensionPlanFor(agentDefs: AgentDefaults | null): { paths: string[] } | { error: string } {
-  if (agentDefs?.cli && agentDefs.cli !== "pi") return { paths: [] };
   const sources = loadSubagentPolicyExtensions();
   if (!Array.isArray(sources)) return sources;
   const inherited = inheritedPolicyExtensions();
@@ -788,7 +786,7 @@ function policyExtensionPlanFor(agentDefs: AgentDefaults | null): { paths: strin
  */
 function resumePolicyExtensions(
   loadout: Pick<SubagentLoadout, "policyExtensions" | "cli">,
-  planNow: () => { paths: string[] } | { error: string } = () => policyExtensionPlanFor(loadout.cli ? { cli: loadout.cli } as AgentDefaults : null),
+  planNow: () => { paths: string[] } | { error: string } = () => policyExtensionPlanFor(null),
 ): { paths: string[] } | { error: string } {
   const now = planNow();
   if ("error" in now) return now;
@@ -1215,11 +1213,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
     const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
-    const right = statusConfig.enabled
-      ? formatWidgetRightLabel(snapshot)
-      : agent.cli === "claude"
-        ? " running… "
-        : " starting… ";
+    const right = statusConfig.enabled ? formatWidgetRightLabel(snapshot) : " starting… ";
 
     lines.push(borderLine(left, right, width));
   }
@@ -1429,7 +1423,6 @@ function syncHerdrAgentState(running: RunningSubagent, observedAt: number): void
 
 /** Settle the pane at idle and hand lifecycle authority back to herdr. */
 function finishHerdrAgentState(running: RunningSubagent): void {
-  if (running.cli === "claude") return;
   if (running.herdrState && running.herdrState !== "idle") {
     reportAgentState(running.surface, running.name, "idle");
   }
@@ -1438,7 +1431,6 @@ function finishHerdrAgentState(running: RunningSubagent): void {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
 
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
@@ -1686,16 +1678,9 @@ function findBatchSpawnProblem(
       );
     }
     try {
-      assertCliToolsCompatible(task.agent, defs?.cli, defs?.tools);
+      assertPiRunner(task.agent, defs?.cli);
     } catch (err: any) {
       return err?.message ?? String(err);
-    }
-    if (defs?.cli && defs.cli !== "pi") {
-      try {
-        cliLaunchWords(defs.cli, "");
-      } catch (err: any) {
-        return `Agent "${task.agent}": ${err?.message ?? String(err)}`;
-      }
     }
     const plan = planFor({ agent: task.agent, task: "", model: task.model }, defs);
     if ("error" in plan) return `Agent "${task.agent}": ${plan.error}`;
@@ -1714,13 +1699,23 @@ function findBatchSpawnProblem(
  * one — and this throws for anything else rather than building a command that
  * will fail in a pane nobody is watching.
  */
-function cliLaunchWords(cliName: string, pluginDir: string): string[] {
-  if (cliName !== "claude") {
-    throw new Error(`Unknown CLI runner: ${cliName}. Supported: claude.`);
-  }
-  const words = ["claude", "--dangerously-skip-permissions"];
-  if (existsSync(pluginDir)) words.push("--plugin-dir", shellEscape(pluginDir));
-  return words;
+function cliLaunchWords(cliName: string, _pluginDir: string): string[] {
+  throw new Error(`cli: ${cliName} is not supported: sub-agents only run pi.`);
+}
+
+/**
+ * Sub-agents only ever run pi. An agent declaring any other `cli:` runner
+ * (e.g. `cli: claude`, the Claude Code CLI) is refused before a pane, worktree
+ * or session exists: such a runner loads no pi extensions, so it would bypass
+ * the tool allowlist and every policy extension. An absent, empty or `pi`
+ * value is pi.
+ */
+function assertPiRunner(agentName: string, cli: string | undefined | null): void {
+  if (!cli || cli === "pi") return;
+  throw new Error(
+    `Agent "${agentName}" declares cli: ${cli}. Sub-agents only run pi, so this spawn is refused. ` +
+      `Remove the cli: line from the agent definition.`,
+  );
 }
 
 /**
@@ -1847,6 +1842,7 @@ export const __test__ = {
   resumePolicyExtensions,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
+  assertPiRunner,
   startWidgetRefresh,
   resumeBlockedByLiveRun,
   launchSubagent,
@@ -1857,7 +1853,6 @@ export const __test__ = {
   structuredFields,
   registryEntryFor,
   childFinalMessage,
-  claudeFinalMessage,
   cliLaunchWords,
   findBatchSpawnProblem,
   applySandboxToParts,
@@ -1955,7 +1950,7 @@ async function launchSubagentInner(
         `silently dropped. Write it on one line: \`tools: read, bash\`.`,
     );
   }
-  assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
+  assertPiRunner(params.agent ?? "subagent", agentDefs?.cli);
   const providerPlan = providerExtensionPlanFor(params, agentDefs, ctx);
   if ("error" in providerPlan) throw new Error(providerPlan.error);
   const policyPlan = policyExtensionPlanFor(agentDefs);
@@ -2051,69 +2046,6 @@ async function launchSubagentInner(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── External CLI path (Claude Code) ──
-  // Each CLI gets its own launch command but shares the same sentinel
-  // mechanism: the wrapper prints a run-unique exit sentinel (see sentinelEcho).
-  if (agentDefs?.cli && agentDefs.cli !== "pi") {
-    const cliName = agentDefs.cli;
-    const sentinelFile = `/tmp/pi-subagent-${cliName}-${id}-done`;
-    const pluginDir = join(SUBAGENTS_DIR, "plugin");
-
-    const cmdParts: string[] = [];
-    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-    cmdParts.push(...cliLaunchWords(cliName, pluginDir));
-
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
-    }
-
-    const sp = agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
-    }
-
-    // Always pass the task as the prompt.
-    cmdParts.push(shellEscape(params.task));
-
-    const command = `${cmdParts.join(" ")}; ${sentinelEcho(id)}`;
-    const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# ${cliName} subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      startTime,
-      sessionFile: subagentSessionFile,
-      launchScriptFile,
-      cli: cliName,
-      sentinelFile,
-      interactive: effectiveInteractive,
-      statusState: createStatusState({
-        // The switch above throws for anything else, so this is provably
-        // "claude" — and SubagentStatusSource has no other external member.
-        source: "claude",
-        startTimeMs: startTime,
-      }),
-      ...(worktreePath ? { worktreePath } : {}),
-      ...(agentDefs.outputSchema ? { outputSchema: agentDefs.outputSchema } : {}),
-    };
-
-    runningSubagents.set(id, running);
-    return running;
-  }
-
   // ── Pi CLI path ──
 
   // Build pi command
@@ -2266,21 +2198,6 @@ const CLAUDE_SESSIONS_DIR = join(
   ".pi", "agent", "sessions", "claude-code",
 );
 
-function copyClaudeSession(sentinelFile: string): string | null {
-  try {
-    const transcriptFile = sentinelFile + ".transcript";
-    if (!existsSync(transcriptFile)) return null;
-    const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
-    if (!transcriptPath || !existsSync(transcriptPath)) return null;
-    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
-    const dest = join(CLAUDE_SESSIONS_DIR, filename);
-    copyFileSync(transcriptPath, dest);
-    return filename;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Detect an `ask_question` signal from a still-running subagent and notify the
@@ -2365,22 +2282,6 @@ function resolvePiSummary(
   };
 }
 
-/**
- * A `cli: claude` child's own final message, or null when it produced none.
- *
- * Only the Stop hook's sentinel file carries it. Takes the running record
- * rather than a path so there is no separate "is this really a final message"
- * flag for a caller to compute wrongly — the null IS the flag.
- */
-function claudeFinalMessage(running: { sentinelFile?: string }): string | null {
-  if (!running.sentinelFile) return null;
-  try {
-    const text = readFileSync(running.sentinelFile, "utf-8").trim();
-    return text === "" ? null : text;
-  } catch {
-    return null;
-  }
-}
 
 function structuredFields(
   summary: string,
@@ -2443,58 +2344,6 @@ async function watchSubagent(
         exitCode: result.exitCode,
         elapsed,
         ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-      };
-    }
-
-    if (running.cli === "claude") {
-      // Claude Code result extraction
-      const claudeFinal = claudeFinalMessage(running);
-      let summary = claudeFinal ?? "";
-      // Only the sentinel file holds the agent's actual final message. The
-      // fallbacks below are a 200-line screen scrape and a canned exit string —
-      // validating those would either warn on every run or pick a stray `{...}`
-      // out of terminal noise and report it as valid output.
-      const summaryIsFinalMessage = claudeFinal !== null;
-
-      if (!summary) {
-        try {
-          summary = readScreen(surface, 200)
-            .replace(new RegExp(sentinelPattern(running.id), "g"), "")
-            .trimEnd();
-        } catch {
-          // The pane is gone (closed by hand, or reaped with its tab). Fall
-          // through to the exit-code message rather than losing the result.
-        }
-      }
-
-      if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
-      }
-
-      // Copy Claude session transcript
-      let sessionId: string | null = null;
-      if (running.sentinelFile) {
-        sessionId = copyClaudeSession(running.sentinelFile);
-        try { unlinkSync(running.sentinelFile); } catch {}
-        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
-      }
-
-      finishHerdrAgentState(running);
-      closeSurface(surface);
-      const worktree = finishRunningWorktree(running);
-      runningSubagents.delete(running.id);
-
-      return {
-        name,
-        task,
-        summary,
-        ...(summaryIsFinalMessage ? structuredFields(summary, running.outputSchema) : {}),
-        exitCode: result.exitCode,
-        elapsed,
-        ...(sessionId ? { claudeSessionId: sessionId } : {}),
-        ...worktree,
       };
     }
 
@@ -3079,6 +2928,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // A session recorded under a non-pi runner (cli: claude, before sub-agents
+        // were pi-only) is refused: resuming it would relaunch that runner.
+        if (loadout.cli && loadout.cli !== "pi") {
+          const err = `Cannot resume "${requestedName}": it ran under cli: ${loadout.cli}, and sub-agents only run pi. Re-run the task as a fresh subagent.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 

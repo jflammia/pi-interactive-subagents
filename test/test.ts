@@ -4040,6 +4040,30 @@ describe("cli: runners cannot silently drop a tools: allowlist", () => {
   });
 });
 
+describe("subagents only ever run pi", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("refuses any cli: runner other than pi, by name, before anything opens", () => {
+    for (const cli of ["claude", "codex", "cursor", "anything"]) {
+      assert.throws(
+        () => testApi.assertPiRunner("worker", cli),
+        new RegExp(`Agent "worker" declares cli: ${cli}.*only run pi`),
+        `cli: ${cli} must be refused`,
+      );
+    }
+    for (const cli of [undefined, "", "pi"]) assert.doesNotThrow(() => testApi.assertPiRunner("worker", cli));
+  });
+
+  it("a batch with a cli: claude agent is refused before any of it launches", () => {
+    const load = (agent: string) => (agent === "claudeok" ? { name: "claudeok", cli: "claude" } : null);
+    assert.match(testApi.findBatchSpawnProblem([{ agent: "claudeok" }], load) ?? "", /declares cli: claude.*only run pi/);
+  });
+
+  it("the Claude Code launch words are no longer reachable", () => {
+    assert.throws(() => testApi.cliLaunchWords("claude", "/nonexistent"), /only run pi/);
+  });
+});
+
 describe("the widget interval does not run in a headless session", () => {
   const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
   const testApi = (subagentsModule as any).__test__;
@@ -4068,194 +4092,6 @@ describe("the widget interval does not run in a headless session", () => {
     const existing = currentInterval();
     if (existing) clearInterval(existing);
     (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-  });
-});
-
-describe("the Claude Stop hook signals completion on every turn boundary", () => {
-  const HOOK = join(
-    dirname(fileURLToPath(import.meta.url)),
-    "..",
-    "pi-extension",
-    "subagents",
-    "plugin",
-    "hooks",
-    "on-stop.sh",
-  );
-
-  function runHook(payload: object, sentinel: string, transcript?: string) {
-    const input = JSON.stringify(payload);
-    const result = execFileSync("bash", [HOOK], {
-      input,
-      encoding: "utf8",
-      env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel },
-    });
-    void result;
-    void transcript;
-  }
-
-  it("writes the sentinel even after a steer or a skill added user messages", () => {
-    // The hook used to fire only when the transcript held EXACTLY one user
-    // message. One steer — or any Skill invocation, which also appends one —
-    // meant no sentinel ever, and the parent watched a finished agent until
-    // its timeout.
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-      const transcript = join(dir, "transcript.jsonl");
-      writeFileSync(
-        transcript,
-        [
-          JSON.stringify({ type: "user", message: { role: "user", content: "do the thing" } }),
-          JSON.stringify({ type: "assistant", message: { role: "assistant", content: "ok" } }),
-          JSON.stringify({ type: "user", message: { role: "user", content: "also this" } }),
-        ].join("\n") + "\n",
-      );
-
-      runHook(
-        {
-          stop_hook_active: false,
-          transcript_path: transcript,
-          last_assistant_message: "FINAL ANSWER",
-        },
-        sentinel,
-      );
-
-      assert.equal(existsSync(sentinel), true, "sentinel must be written regardless of user-message count");
-      assert.equal(readFileSync(sentinel, "utf-8").trim(), "FINAL ANSWER");
-      assert.equal(readFileSync(`${sentinel}.transcript`, "utf-8").trim(), transcript);
-    });
-  });
-
-  it("still signals completion when the transcript is gone", () => {
-    // last_assistant_message rides the stdin payload, so a rotated or
-    // compacted-away transcript must not suppress the only completion signal.
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-
-      runHook(
-        {
-          stop_hook_active: false,
-          transcript_path: join(dir, "does-not-exist.jsonl"),
-          last_assistant_message: "DONE ANYWAY",
-        },
-        sentinel,
-      );
-
-      assert.equal(existsSync(sentinel), true, "a missing transcript must not suppress completion");
-      assert.equal(readFileSync(sentinel, "utf-8").trim(), "DONE ANYWAY");
-    });
-  });
-
-  it("writes the transcript pointer before the completion sentinel", () => {
-    // The sentinel's EXISTENCE is what tells the parent the run finished; it
-    // then immediately copies the Claude session via the .transcript pointer
-    // and deletes both. Writing the sentinel first opens a window where the
-    // parent sees completion, finds no pointer, and loses the session copy.
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-      const transcript = join(dir, "transcript.jsonl");
-      writeFileSync(transcript, "{}\n");
-
-      runHook(
-        {
-          stop_hook_active: false,
-          transcript_path: transcript,
-          last_assistant_message: "FINAL ANSWER",
-        },
-        sentinel,
-      );
-
-      const pointerAt = statSync(`${sentinel}.transcript`).mtimeMs;
-      const sentinelAt = statSync(sentinel).mtimeMs;
-      assert.ok(
-        pointerAt <= sentinelAt,
-        `the .transcript pointer must land first (pointer ${pointerAt} vs sentinel ${sentinelAt})`,
-      );
-    });
-  });
-
-  it("never leaves the sentinel visible before the transcript pointer", async () => {
-    // Comparing final mtimes is not enough: a hook that creates the sentinel
-    // early and rewrites it later still ends with the right order on disk,
-    // while the parent — which polls and acts on the sentinel's EXISTENCE —
-    // sees completion with no pointer and loses the session copy.
-    const dir = mkdtempSync(join(tmpdir(), "hookorder-"));
-    try {
-      const sentinel = join(dir, "sentinel");
-      const transcript = join(dir, "transcript.jsonl");
-      writeFileSync(transcript, "{}\n");
-
-      let sawSentinelWithoutPointer = false;
-      const watcher = setInterval(() => {
-        if (existsSync(sentinel) && !existsSync(`${sentinel}.transcript`)) {
-          sawSentinelWithoutPointer = true;
-        }
-      }, 1);
-
-      const child = spawn("bash", [HOOK], {
-        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel },
-        stdio: ["pipe", "ignore", "ignore"],
-      });
-      child.stdin.end(
-        JSON.stringify({
-          stop_hook_active: false,
-          transcript_path: transcript,
-          last_assistant_message: "FINAL ANSWER",
-        }),
-      );
-      await new Promise((resolve) => child.on("close", resolve));
-      // Keep watching briefly in case the pointer lags the sentinel.
-      await new Promise((r) => setTimeout(r, 50));
-      clearInterval(watcher);
-
-      assert.equal(
-        sawSentinelWithoutPointer,
-        false,
-        "the parent must never observe completion before the pointer it needs",
-      );
-      assert.equal(existsSync(`${sentinel}.transcript`), true);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("swaps the sentinel into place instead of truncating it", () => {
-    // The parent treats the sentinel's EXISTENCE as completion, so a plain `>`
-    // truncate exposes a complete signal carrying an empty result.
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-      writeFileSync(sentinel, "stale content");
-      const inodeBefore = statSync(sentinel).ino;
-
-      runHook({ stop_hook_active: false, last_assistant_message: "FRESH ANSWER" }, sentinel);
-
-      assert.notEqual(
-        statSync(sentinel).ino,
-        inodeBefore,
-        "the sentinel must be renamed into place, not written through",
-      );
-      assert.equal(readFileSync(sentinel, "utf-8").trim(), "FRESH ANSWER");
-    });
-  });
-
-  it("leaves no temp files behind", () => {
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-      runHook({ stop_hook_active: false, last_assistant_message: "x" }, sentinel);
-      const strays = readdirSync(dir).filter((f) => f.startsWith("sentinel."));
-      assert.deepEqual(
-        strays.filter((f) => f !== "sentinel.transcript"),
-        [],
-        "the atomic write must not leave a .$$ temp file",
-      );
-    });
-  });
-
-  it("does nothing when the loop guard is set", () => {
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-      runHook({ stop_hook_active: true, last_assistant_message: "should not appear" }, sentinel);
-      assert.equal(existsSync(sentinel), false, "stop_hook_active must still short-circuit");
-    });
   });
 });
 
@@ -4737,7 +4573,8 @@ describe("gaps the mutation sweep exposed", () => {
     const load = (a: string) => defs[a] ?? null;
 
     assert.equal(testApi.findBatchSpawnProblem([{ agent: "good" }], load), null);
-    assert.equal(testApi.findBatchSpawnProblem([{ agent: "claudeok" }], load), null);
+    // Sub-agents only run pi: any cli: runner is refused, with or without tools:.
+    assert.match(testApi.findBatchSpawnProblem([{ agent: "claudeok" }], load) ?? "", /declares cli: claude.*only run pi/);
     assert.equal(testApi.findBatchSpawnProblem([], load), null);
 
     // A provider that would leave the child without its model is caught before
@@ -4759,11 +4596,11 @@ describe("gaps the mutation sweep exposed", () => {
     );
     assert.match(
       testApi.findBatchSpawnProblem([{ agent: "conflicted" }], load) ?? "",
-      /Refusing the spawn/,
+      /declares cli: claude.*only run pi/,
     );
     assert.match(
       testApi.findBatchSpawnProblem([{ agent: "deadcli" }], load) ?? "",
-      /Unknown CLI runner/,
+      /declares cli: codex.*only run pi/,
     );
     // An unknown agent is handled by the caller's own allowlist check.
     assert.equal(testApi.findBatchSpawnProblem([{ agent: "nosuch" }], load), null);
@@ -4781,24 +4618,12 @@ describe("gaps the mutation sweep exposed", () => {
     }
   });
 
-  it("supports exactly one external runner and refuses the rest by name", () => {
-    const words = testApi.cliLaunchWords("claude", "/nonexistent/plugin/dir");
-    assert.deepEqual(words, ["claude", "--dangerously-skip-permissions"]);
-
-    // With the plugin dir present it must be passed — that directory holds the
-    // Stop hook, which is the child's only completion signal.
-    withTempDir((pluginDir) => {
-      const withPlugin = testApi.cliLaunchWords("claude", pluginDir);
-      assert.deepEqual(withPlugin.slice(0, 2), ["claude", "--dangerously-skip-permissions"]);
-      assert.equal(withPlugin[2], "--plugin-dir");
-      assert.match(withPlugin[3], new RegExp(pluginDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    });
-
-    for (const dead of ["codex", "cursor", "grok", ""]) {
+  it("builds no launch command for any external runner", () => {
+    for (const cli of ["claude", "codex", "cursor", "grok", ""]) {
       assert.throws(
-        () => testApi.cliLaunchWords(dead, "/nonexistent/plugin/dir"),
-        /Unknown CLI runner/,
-        `${dead || "(empty)"} must not build a launch command`,
+        () => testApi.cliLaunchWords(cli, "/nonexistent/plugin/dir"),
+        /only run pi/,
+        `${cli || "(empty)"} must not build a launch command`,
       );
     }
   });
@@ -4825,29 +4650,6 @@ describe("gaps the mutation sweep exposed", () => {
       __herdrApiTest__.isBusyProcessInfo({ foreground_process_group_id: 2, shell_pid: 1 }),
       true,
     );
-  });
-
-  it("reads a claude final message only from the sentinel, and says null otherwise", () => {
-    withTempDir((dir) => {
-      const sentinel = join(dir, "sentinel");
-
-      assert.equal(testApi.claudeFinalMessage({}), null, "no sentinel path at all");
-      assert.equal(
-        testApi.claudeFinalMessage({ sentinelFile: sentinel }),
-        null,
-        "sentinel not written yet",
-      );
-
-      writeFileSync(sentinel, "   \n  ");
-      assert.equal(
-        testApi.claudeFinalMessage({ sentinelFile: sentinel }),
-        null,
-        "an empty sentinel is not a final message — it must not be schema-validated",
-      );
-
-      writeFileSync(sentinel, "  FINAL ANSWER\n");
-      assert.equal(testApi.claudeFinalMessage({ sentinelFile: sentinel }), "FINAL ANSWER");
-    });
   });
 
   it("runs the queued rebalance after the in-flight one finishes", async () => {

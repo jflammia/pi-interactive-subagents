@@ -36,9 +36,9 @@ Everything below is how sub-agents behave in this extension.
   explicit tool allowlist, and nothing about the herdr integration widens that
   — state is reported by the parent, so herdr never learns a session it could
   relaunch unsandboxed. See [herdr agent state](#herdr-agent-state).
-  `cli: claude` agents are the exception: they run under Claude Code's own
-  permission model (`--dangerously-skip-permissions`), not pi's allowlist, so
-  declaring both `cli:` and `tools:` is refused rather than silently widened.
+  Sub-agents only run pi: an agent that declares a `cli:` runner (for example
+  `cli: claude`) is refused at spawn, because another program would load none
+  of pi's extensions and enforce none of its allowlist.
 
 Requires [herdr](https://herdr.dev); pi must be running in a herdr pane.
 
@@ -175,7 +175,7 @@ You are a specialized agent that does X...
 | `cwd` | string | Default working directory |
 | `worktree` | boolean | Run this agent in its own git worktree so parallel editors don't collide (see below) |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi (outside pi's tool allowlist — cannot be combined with `tools:`) |
+| `cli` | string | Only `pi` (the default). Any other value, such as `claude`, is refused at spawn: sub-agents only run pi |
 | `output-schema` | string | JSON Schema the agent's final message must satisfy — inline JSON, or a path to a `.json` file |
 
 ### session-mode
@@ -238,7 +238,7 @@ the agent's body as well, or nothing will ask it to produce JSON.
 
 Access is **whitelist-only**. Every **pi** sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
 
-`cli: claude` agents are outside this mechanism entirely: Claude Code enforces its own permissions, and a pane has nobody to answer its prompts, so the runner passes `--dangerously-skip-permissions`. An agent declaring both `cli:` and `tools:` is therefore refused at spawn — honoring the `cli:` would silently hand the child every tool.
+Every sub-agent is a pi process, so this mechanism always applies. An agent declaring a `cli:` runner other than `pi` is refused at spawn rather than launched outside it.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
@@ -259,7 +259,7 @@ Extensions can register additional tools for sub-agents at runtime via `register
 ```
 
 - The value is a pi package source, resolved with pi's `DefaultPackageManager.getInstalledPath(source, "user")`, or a `builtin:<name>` extension. The package must be installed at **user** scope (`pi install <source>`, not `-l`); a local path is relative to the agent dir. It is not installed for you.
-- It applies to whichever model the spawn resolves to (the `model` param, `subagents.agentOverrides`, or frontmatter), only for restricted pi sub-agents, and only to `provider/model` references. A bare model id names no provider and is passed through unchanged. Unrestricted spawns and `cli:` runners already have their providers.
+- It applies to whichever model the spawn resolves to (the `model` param, `subagents.agentOverrides`, or frontmatter), only for restricted pi sub-agents, and only to `provider/model` references. A bare model id names no provider and is passed through unchanged. Unrestricted spawns already have their providers.
 - `--tools` still bounds every tool the child can call, the extension's included, and with `--no-extensions` pi's built-in MCP support is off, so an MCP server the extension registers never connects. The extension's own code (event handlers, commands) does run in the child: map only providers you trust.
 - Refused at spawn, before a pane exists, with the fix in the message: a `provider/model` whose provider this pi process reports as registered by an extension (`modelRegistry.getRegisteredProviderIds()`) but has no mapping, and a mapping that is not installed. A provider this process never loaded is not detected; the child then fails with "model not found".
 - A pi built-in provider (`getBuiltinProviders()` from `@earendil-works/pi-ai/providers/all`) is never refused, even when an extension re-registers it in the parent: the child uses pi's own provider. An extension that only wraps or filters a built-in (for example one that hides some models) therefore does not run in the child. If the extension *adds* models to a built-in provider, or changes its endpoint or auth, the child does not get them; map the provider to the extension to load it back.
@@ -285,7 +285,7 @@ Extensions can register additional tools for sub-agents at runtime via `register
 - Every **pi** sub-agent loads them, restricted or not, because an unrestricted one may run with a target-local `.pi/agent` whose settings do not list them. Pi loads a path only once, so one already in the child's settings is not loaded twice. `--tools` still bounds every tool a restricted child can call.
 - Nested sub-agents inherit their parent's resolved paths (`PI_SUBAGENT_POLICY_EXTENSIONS`), in addition to their own list.
 - Resume loads the snapshot's paths plus the current list, so a sub-agent spawned before a policy existed does not resume without it. Resume is refused if one of them is gone.
-- `cli:` runners (`cli: claude`) run no pi extensions, so this list does not apply to them.
+- Every sub-agent is a pi process (a `cli:` runner is refused), so no sub-agent runs without them.
 
 ## Role folders
 
@@ -344,8 +344,6 @@ refuses, and `session.resume_agents_on_restore` is global-only, so opting out
 would disable restore for your own panes too. Reporting state without a session
 reference gives herdr the state it needs and nothing to resume.
 
-`cli: claude` sub-agents are left alone here: herdr's Claude Code integration is
-a global hook, so those panes already report for themselves.
 
 ## Requirements
 
