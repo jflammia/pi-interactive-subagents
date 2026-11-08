@@ -281,9 +281,11 @@ Extensions can register additional tools for sub-agents at runtime via `register
 ```
 
 - Each entry is resolved like a `providerExtensions` value: a user-scope pi package source, or `builtin:<name>`.
-- An entry that is not installed is refused at spawn, before a pane exists. It is never skipped, because a child without its policy would run unchecked.
-- `--tools` still bounds every tool the child can call. Unrestricted spawns already keep every extension, and `cli:` runners run no pi extensions, so neither needs this.
-- The resolved paths are part of the loadout snapshot. Resume is refused if one of them is gone.
+- It fails closed. An entry that is not installed, a list that is not a list of sources, or a settings file that is not valid JSON refuses the spawn before a pane exists. Leaving the key out means no policy.
+- Every **pi** sub-agent loads them, restricted or not, because an unrestricted one may run with a target-local `.pi/agent` whose settings do not list them. Pi loads a path only once, so one already in the child's settings is not loaded twice. `--tools` still bounds every tool a restricted child can call.
+- Nested sub-agents inherit their parent's resolved paths (`PI_SUBAGENT_POLICY_EXTENSIONS`), in addition to their own list.
+- Resume loads the snapshot's paths plus the current list, so a sub-agent spawned before a policy existed does not resume without it. Resume is refused if one of them is gone.
+- `cli:` runners (`cli: claude`) run no pi extensions, so this list does not apply to them.
 
 ## Role folders
 

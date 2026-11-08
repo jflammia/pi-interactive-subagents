@@ -555,24 +555,52 @@ function loadSubagentProviderExtensions(): Record<string, string> {
  * the child can call. Entries that are not non-empty strings are dropped;
  * duplicates are removed, order kept.
  */
-function loadSubagentPolicyExtensions(): string[] {
+function loadSubagentPolicyExtensions(): string[] | { error: string } {
   const settingsPath = join(getAgentConfigDir(), "settings.json");
   if (!existsSync(settingsPath)) return [];
+  const refuse = (why: string) => ({
+    error:
+      `${settingsPath}: ${why}, so the policies subagents.policyExtensions names cannot be ` +
+      `applied. A restricted subagent would run without them, so the spawn is refused. Fix the file.`,
+  });
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as unknown;
   } catch {
-    return [];
+    return refuse("not valid JSON");
   }
   const subagents = (parsed as { subagents?: unknown } | null)?.subagents;
   const list = (subagents as { policyExtensions?: unknown } | null)?.policyExtensions;
-  if (!Array.isArray(list)) return [];
+  if (list === undefined || list === null) return [];
+  if (!Array.isArray(list)) return refuse("subagents.policyExtensions is not a list");
   const result: string[] = [];
   for (const source of list) {
-    if (typeof source !== "string" || !source.trim()) continue;
+    if (typeof source !== "string" || !source.trim()) {
+      return refuse(`subagents.policyExtensions has an entry that is not a package source (${JSON.stringify(source)})`);
+    }
     if (!result.includes(source.trim())) result.push(source.trim());
   }
   return result;
+}
+
+/** Env var carrying a parent's resolved policy paths to the subagents it spawns. */
+const POLICY_EXTENSIONS_ENV = "PI_SUBAGENT_POLICY_EXTENSIONS";
+
+/**
+ * The policy paths a parent subagent passed down. A nested subagent may read a
+ * different agent dir (a target-local `.pi/agent`) whose settings lack the list,
+ * so it must still load what its parent loaded.
+ */
+function inheritedPolicyExtensions(): string[] | { error: string } {
+  const raw = process.env[POLICY_EXTENSIONS_ENV];
+  if (raw === undefined || raw === "") return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed) && parsed.every((p) => typeof p === "string" && p.trim())) return parsed as string[];
+  } catch {
+    /* fall through */
+  }
+  return { error: `${POLICY_EXTENSIONS_ENV} is set but is not a JSON list of paths, so this subagent's policies are unknown.` };
 }
 
 /**
@@ -736,9 +764,30 @@ function providerExtensionPlanFor(
  */
 function policyExtensionPlanFor(agentDefs: AgentDefaults | null): { paths: string[] } | { error: string } {
   if (agentDefs?.cli && agentDefs.cli !== "pi") return { paths: [] };
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
-  const restricted = buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning }) !== null;
-  return planPolicyExtensions({ restricted, sources: restricted ? loadSubagentPolicyExtensions() : [] });
+  const sources = loadSubagentPolicyExtensions();
+  if (!Array.isArray(sources)) return sources;
+  const inherited = inheritedPolicyExtensions();
+  if (!Array.isArray(inherited)) return inherited;
+  // Every pi child gets them, restricted or not: an unrestricted child may run with a
+  // target-local agent dir whose settings do not list the policies. Pi dedupes a path
+  // it already loads from settings (resource-loader mergePaths).
+  const plan = planPolicyExtensions({ restricted: true, sources });
+  if ("error" in plan) return plan;
+  return { paths: [...new Set([...inherited, ...plan.paths])] };
+}
+
+/**
+ * The policy paths a resumed subagent loads: those in its snapshot, plus whatever
+ * is configured now. A snapshot written before the list existed (or before a
+ * policy was added) must not resume without it.
+ */
+function resumePolicyExtensions(
+  loadout: Pick<SubagentLoadout, "policyExtensions" | "cli">,
+  planNow: () => { paths: string[] } | { error: string } = () => policyExtensionPlanFor(loadout.cli ? { cli: loadout.cli } as AgentDefaults : null),
+): { paths: string[] } | { error: string } {
+  const now = planNow();
+  if ("error" in now) return now;
+  return { paths: [...new Set([...(loadout.policyExtensions ?? []), ...now.paths])] };
 }
 
 /** Provider ids registered by extensions in this pi process (empty when unknown). */
@@ -1302,12 +1351,18 @@ function applySandboxToParts(
     for (const extPath of loadout.providerExtensions ?? []) {
       extPaths.add(extPath);
     }
-    // Policy extensions (subagents.policyExtensions) load into every restricted
-    // child so it enforces the same policy as its parent.
+    // Policy extensions (subagents.policyExtensions) load into every
+    // restricted child so it enforces the same policy as its parent.
     for (const extPath of loadout.policyExtensions ?? []) {
       extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
+      parts.push("-e", shellEscape(extPath));
+    }
+  } else {
+    // An unrestricted child loads its own settings' extensions, which may come
+    // from a target-local agent dir without the policies: load them explicitly.
+    for (const extPath of loadout.policyExtensions ?? []) {
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -1784,6 +1839,7 @@ export const __test__ = {
   loadSubagentPolicyExtensions,
   planPolicyExtensions,
   policyExtensionPlanFor,
+  resumePolicyExtensions,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
@@ -2111,6 +2167,9 @@ async function launchSubagentInner(
 
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
+  }
+  if (policyPlan.paths.length > 0) {
+    envParts.push(`${POLICY_EXTENSIONS_ENV}=${shellEscape(JSON.stringify(policyPlan.paths))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
@@ -3018,12 +3077,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        // Refuse before a pane exists when the snapshot names a provider
-        // extension that has since been removed.
+        // Resume with the snapshot's policies plus whatever is configured now, so
+        // an older snapshot (or a policy added since) never resumes ungated.
+        const resumePolicy = resumePolicyExtensions(loadout);
+        if ("error" in resumePolicy) {
+          const err = `Cannot resume "${requestedName}": ${resumePolicy.error}`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        loadout.policyExtensions = resumePolicy.paths.length > 0 ? resumePolicy.paths : null;
+
+        // Refuse before a pane exists when the snapshot names a provider or
+        // policy extension that has since been removed.
         const missingProviderPaths = missingProviderExtensionPaths(loadout);
         if (missingProviderPaths.length > 0) {
           const err =
-            `Cannot resume "${requestedName}": its model's provider extension is no longer installed ` +
+            `Cannot resume "${requestedName}": a provider or policy extension it loads is no longer installed ` +
             `(${missingProviderPaths.join(", ")}). Reinstall it, or re-run the task as a fresh subagent.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
@@ -3090,6 +3158,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         if (loadout.spawnable && loadout.spawnable.length > 0) {
           resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
+        }
+        if (loadout.policyExtensions && loadout.policyExtensions.length > 0) {
+          resumeEnvParts.push(`${POLICY_EXTENSIONS_ENV}=${shellEscape(JSON.stringify(loadout.policyExtensions))}`);
         }
         if (loadout.agent) {
           resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);

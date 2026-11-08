@@ -1531,7 +1531,6 @@ describe("subagent discovery", () => {
             " git:git.blueshift.xyz/blueshift/pi-anthropic-gate ",
             "git:git@git.blueshift.xyz:blueshift/pi-openai-gate",
             "git:git.blueshift.xyz/blueshift/pi-anthropic-gate", // duplicate
-            "", "   ", 42, null, { source: "x" }, // dropped: nothing a child could load
           ],
         },
       });
@@ -1539,10 +1538,8 @@ describe("subagent discovery", () => {
         "git:git.blueshift.xyz/blueshift/pi-anthropic-gate",
         "git:git@git.blueshift.xyz:blueshift/pi-openai-gate",
       ]);
-      for (const bad of ["pi-anthropic-gate", { a: 1 }, null]) {
-        writeSettingsFile(globalDir, { subagents: { policyExtensions: bad } });
-        assert.deepEqual(testApi.loadSubagentPolicyExtensions(), [], JSON.stringify(bad));
-      }
+      writeSettingsFile(globalDir, { subagents: { policyExtensions: null } });
+      assert.deepEqual(testApi.loadSubagentPolicyExtensions(), [], "null: no policy");
     });
   });
 
@@ -1590,6 +1587,80 @@ describe("subagent discovery", () => {
   it("missingProviderExtensionPaths also reports a policy extension removed since spawn", () => {
     const loadout = { providerExtensions: null, policyExtensions: ["/nonexistent/gate", "builtin:mcp"] };
     assert.deepEqual(testApi.missingProviderExtensionPaths(loadout), ["/nonexistent/gate"]);
+  });
+
+  it("loadSubagentPolicyExtensions fails closed on a settings file or list it cannot read", async () => {
+    // An absent key is "no policy configured"; anything present but unusable must refuse,
+    // or a typo would launch every subagent without its gates.
+    for (const [label, contents] of [
+      ["malformed JSON", "{ not json"],
+      ["a string list", { subagents: { policyExtensions: "git:example/gate" } }],
+      ["an object list", { subagents: { policyExtensions: { a: "git:example/gate" } } }],
+      ["a non-string entry", { subagents: { policyExtensions: ["git:example/gate", 42] } }],
+      ["an empty entry", { subagents: { policyExtensions: ["  "] } }],
+    ] as Array<[string, unknown]>) {
+      await withIsolatedAgentEnv(async ({ globalDir }) => {
+        writeSettingsFile(globalDir, contents);
+        const r = testApi.loadSubagentPolicyExtensions();
+        assert.ok(!Array.isArray(r) && "error" in r, `${label}: expected a refusal, got ${JSON.stringify(r)}`);
+      });
+    }
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, { subagents: { providerExtensions: {} } });
+      assert.deepEqual(testApi.loadSubagentPolicyExtensions(), [], "absent key: no policy");
+    });
+  });
+
+  it("policyExtensionPlanFor inherits the parent's resolved policy paths, unioned with its own", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      // A nested subagent may read a different agent dir whose settings lack the list:
+      // the paths its parent resolved still apply.
+      writeSettingsFile(globalDir, {});
+      const before = process.env.PI_SUBAGENT_POLICY_EXTENSIONS;
+      process.env.PI_SUBAGENT_POLICY_EXTENSIONS = JSON.stringify(["/pkgs/gate-a", "/pkgs/gate-b"]);
+      try {
+        assert.deepEqual(testApi.policyExtensionPlanFor({ tools: "read" }), { paths: ["/pkgs/gate-a", "/pkgs/gate-b"] });
+        // Unrestricted children get them too: they may run with a target-local agent dir.
+        assert.deepEqual(testApi.policyExtensionPlanFor(null), { paths: ["/pkgs/gate-a", "/pkgs/gate-b"] });
+        process.env.PI_SUBAGENT_POLICY_EXTENSIONS = "not json";
+        const bad = testApi.policyExtensionPlanFor({ tools: "read" });
+        assert.ok("error" in bad, "an unreadable inherited list refuses");
+      } finally {
+        if (before === undefined) delete process.env.PI_SUBAGENT_POLICY_EXTENSIONS;
+        else process.env.PI_SUBAGENT_POLICY_EXTENSIONS = before;
+      }
+      // cli runners load no pi extensions at all.
+      assert.deepEqual(testApi.policyExtensionPlanFor({ cli: "claude" }), { paths: [] });
+    });
+  });
+
+  it("applySandboxToParts loads policy extensions into an UNRESTRICTED child too", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: null, toolAllowlist: null, model: null, thinking: null, systemPromptMode: null,
+          identity: null, spawnable: null, autoExit: false, cwd: null, agentDir: "/target/.pi/agent",
+          providerExtensions: null, policyExtensions: ["/pkgs/gate-a"],
+        },
+        { artifactDir: d, name: "bare" },
+      );
+      assert.ok(!parts.includes("--no-extensions"), "still unrestricted");
+      const i = parts.indexOf("-e");
+      assert.ok(i >= 0 && parts[i + 1].includes("/pkgs/gate-a"), `expected -e /pkgs/gate-a in ${parts.join(" ")}`);
+    });
+  });
+
+  it("resumePolicyExtensions unions the snapshot with the current policy, and refuses when current settings are unreadable", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      writeSettingsFile(globalDir, {});
+      // A snapshot written before policyExtensions existed resumes with the current policy.
+      assert.deepEqual(testApi.resumePolicyExtensions({ policyExtensions: undefined, cli: null }, () => ({ paths: ["/pkgs/gate-a"] })), { paths: ["/pkgs/gate-a"] });
+      assert.deepEqual(testApi.resumePolicyExtensions({ policyExtensions: ["/pkgs/old"], cli: null }, () => ({ paths: ["/pkgs/gate-a"] })), { paths: ["/pkgs/old", "/pkgs/gate-a"] });
+      const refused = testApi.resumePolicyExtensions({ policyExtensions: ["/pkgs/old"], cli: null }, () => ({ error: "bad settings" }));
+      assert.ok("error" in refused);
+    });
   });
 
   it("planProviderExtensions loads a mapped provider's extension into a restricted child", () => {
