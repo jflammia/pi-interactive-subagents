@@ -872,14 +872,6 @@ describe("status.ts", () => {
     assert.equal(snapshot.waitingDurationText, "3m");
   });
 
-  it("uses elapsed-only fallback for claude-backed subagents", () => {
-    const state = createStatusState({ source: "claude", startTimeMs: 0 });
-    const snapshot = classifyStatus(state, 125_000);
-
-    assert.equal(snapshot.kind, "running");
-    assert.equal(snapshot.elapsedText, "2m");
-  });
-
   it("detects stalled transitions and recovery", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -1636,8 +1628,6 @@ describe("subagent discovery", () => {
         if (before === undefined) delete process.env.PI_SUBAGENT_POLICY_EXTENSIONS;
         else process.env.PI_SUBAGENT_POLICY_EXTENSIONS = before;
       }
-      // cli runners load no pi extensions at all.
-      assert.deepEqual(testApi.policyExtensionPlanFor({ cli: "claude" }), { paths: [] });
     });
   });
 
@@ -1895,11 +1885,6 @@ describe("subagent discovery", () => {
       // No tools: line → unrestricted child → nothing to add.
       assert.deepEqual(
         testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "other/m" }, {}, ctx),
-        { paths: [] },
-      );
-      // cli: runners are outside pi's sandbox.
-      assert.deepEqual(
-        testApi.providerExtensionPlanFor({ agent: "a", task: "T", model: "other/m" }, { cli: "claude" }, ctx),
         { paths: [] },
       );
       // A ctx without a model registry cannot detect anything; the mapping still applies.
@@ -4019,27 +4004,6 @@ function surfaceThatDoesNotExist(): string {
   return "w99:p99";
 }
 
-describe("cli: runners cannot silently drop a tools: allowlist", () => {
-  const testApi = (subagentsModule as any).__test__;
-
-  it("refuses an agent that declares both cli: and tools:", () => {
-    // The claude runner launches --dangerously-skip-permissions, so the
-    // allowlist was dropped and the child ran with every tool.
-    assert.throws(
-      () => testApi.assertCliToolsCompatible("worker", "claude", "read,bash"),
-      /declares both cli: claude and a tools: allowlist|Refusing the spawn/,
-    );
-  });
-
-  it("allows either one alone, and an explicit cli: pi", () => {
-    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", "claude", undefined));
-    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", undefined, "read,bash"));
-    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", "pi", "read,bash"));
-    // An empty tools: is falsy and means "no restriction" everywhere else too.
-    assert.doesNotThrow(() => testApi.assertCliToolsCompatible("worker", "claude", ""));
-  });
-});
-
 describe("subagents only ever run pi", () => {
   const testApi = (subagentsModule as any).__test__;
 
@@ -4054,14 +4018,16 @@ describe("subagents only ever run pi", () => {
     for (const cli of [undefined, "", "pi"]) assert.doesNotThrow(() => testApi.assertPiRunner("worker", cli));
   });
 
+  it("a session recorded under cli: claude cannot be resumed", () => {
+    assert.match(testApi.resumeRunnerRefusal("old", { cli: "claude" }) ?? "", /Cannot resume "old": it ran under cli: claude.*only run pi/);
+    for (const cli of [null, "pi"]) assert.equal(testApi.resumeRunnerRefusal("ok", { cli }), null);
+  });
+
   it("a batch with a cli: claude agent is refused before any of it launches", () => {
     const load = (agent: string) => (agent === "claudeok" ? { name: "claudeok", cli: "claude" } : null);
     assert.match(testApi.findBatchSpawnProblem([{ agent: "claudeok" }], load) ?? "", /declares cli: claude.*only run pi/);
   });
 
-  it("the Claude Code launch words are no longer reachable", () => {
-    assert.throws(() => testApi.cliLaunchWords("claude", "/nonexistent"), /only run pi/);
-  });
 });
 
 describe("the widget interval does not run in a headless session", () => {
@@ -4604,28 +4570,6 @@ describe("gaps the mutation sweep exposed", () => {
     );
     // An unknown agent is handled by the caller's own allowlist check.
     assert.equal(testApi.findBatchSpawnProblem([{ agent: "nosuch" }], load), null);
-  });
-
-  it("refuses any external runner combined with tools:, not just claude", () => {
-    // A guard written as `cli !== "claude"` would wave through an unknown
-    // runner, which is the case most likely to be mis-declared.
-    for (const cli of ["claude", "codex", "cursor", "grok", "anything"]) {
-      assert.throws(
-        () => testApi.assertCliToolsCompatible("worker", cli, "read,bash"),
-        /Refusing the spawn/,
-        `cli: ${cli} with a tools: allowlist must be refused`,
-      );
-    }
-  });
-
-  it("builds no launch command for any external runner", () => {
-    for (const cli of ["claude", "codex", "cursor", "grok", ""]) {
-      assert.throws(
-        () => testApi.cliLaunchWords(cli, "/nonexistent/plugin/dir"),
-        /only run pi/,
-        `${cli || "(empty)"} must not build a launch command`,
-      );
-    }
   });
 
   it("treats a shapeless process-info reply as not busy", () => {

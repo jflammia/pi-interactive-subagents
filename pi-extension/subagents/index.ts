@@ -11,7 +11,6 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
-  copyFileSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -1046,7 +1045,6 @@ interface SubagentResult {
   sessionFile?: string;
   /** Canonical session header id, used for follow-ups via subagent_message. */
   sessionId?: string;
-  claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -1086,7 +1084,6 @@ interface RunningSubagent {
   };
   abortController?: AbortController;
   cli?: string;
-  sentinelFile?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1688,19 +1685,14 @@ function findBatchSpawnProblem(
   return null;
 }
 
+
 /**
- * The command words that start an external CLI runner.
- *
- * codex and cursor were once listed here and could never run: `codex exec` has
- * no --system-prompt and `cursor-agent` has no --append-system-prompt, yet one
- * of those was passed for every agent with a body, so both died at argument
- * parsing. Neither had result extraction or a status source either. A runner
- * that cannot start is worse than no runner, so the supported set is exactly
- * one — and this throws for anything else rather than building a command that
- * will fail in a pane nobody is watching.
+ * A session recorded under a non-pi runner (`cli: claude`, from before
+ * sub-agents were pi-only) cannot be resumed: resuming would relaunch that runner.
  */
-function cliLaunchWords(cliName: string, _pluginDir: string): string[] {
-  throw new Error(`cli: ${cliName} is not supported: sub-agents only run pi.`);
+function resumeRunnerRefusal(name: string, loadout: Pick<SubagentLoadout, "cli">): string | null {
+  if (!loadout.cli || loadout.cli === "pi") return null;
+  return `Cannot resume "${name}": it ran under cli: ${loadout.cli}, and sub-agents only run pi. Re-run the task as a fresh subagent.`;
 }
 
 /**
@@ -1718,33 +1710,6 @@ function assertPiRunner(agentName: string, cli: string | undefined | null): void
   );
 }
 
-/**
- * Refuse an agent that declares BOTH an external `cli:` runner and a `tools:`
- * allowlist.
- *
- * An external CLI cannot enforce pi's allowlist — the claude runner is
- * launched with --dangerously-skip-permissions precisely because a pane has
- * nobody to answer its prompts — so the declared restriction was silently
- * dropped and the child ran unrestricted. Fail closed instead of widening.
- *
- * ponytail: no mapping onto `claude --tools`. pi names don't map 1:1
- * (safe_bash has no analogue, mapping it to Bash WIDENS the very restriction
- * it exists to impose; find/ls/web_search/extension tools have none), and a
- * guess fails silently — which is this defect again, wearing a table.
- */
-function assertCliToolsCompatible(
-  agentName: string,
-  cli: string | undefined,
-  tools: string | undefined,
-): void {
-  if (!tools || !cli || cli === "pi") return;
-  throw new Error(
-    `Agent "${agentName}" declares both cli: ${cli} and a tools: allowlist. ` +
-      `An external CLI runner cannot enforce pi's tool allowlist, so honoring ` +
-      `the cli: would silently give this sub-agent every tool. Refusing the spawn. ` +
-      `Remove tools: to accept an unrestricted ${cli} child, or remove cli: to keep the allowlist.`,
-  );
-}
 
 /**
  * Should a resume be refused because the recorded run is still working?
@@ -1818,7 +1783,12 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
   return { autoExit: true, interactive: false };
 }
 
+let launchFaultForTests: string | null = null;
+
 export const __test__ = {
+  setLaunchFaultForTests(message: string | null) {
+    launchFaultForTests = message;
+  },
   borderLine,
   deliverPendingQuestion,
   getShellReadyDelayMs,
@@ -1841,8 +1811,8 @@ export const __test__ = {
   policyExtensionPlanFor,
   resumePolicyExtensions,
   buildSubagentToolAllowlist,
-  assertCliToolsCompatible,
   assertPiRunner,
+  resumeRunnerRefusal,
   startWidgetRefresh,
   resumeBlockedByLiveRun,
   launchSubagent,
@@ -1853,7 +1823,6 @@ export const __test__ = {
   structuredFields,
   registryEntryFor,
   childFinalMessage,
-  cliLaunchWords,
   findBatchSpawnProblem,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -2006,6 +1975,10 @@ async function launchSubagentInner(
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
+
+  // Test seam: fail after the pane (and worktree) exist, to prove the launch
+  // wrapper cleans both up. Not settable from a spawn call or settings.
+  if (launchFaultForTests) throw new Error(launchFaultForTests);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -2193,10 +2166,6 @@ async function launchSubagentInner(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
-const CLAUDE_SESSIONS_DIR = join(
-  process.env.HOME ?? "/tmp",
-  ".pi", "agent", "sessions", "claude-code",
-);
 
 
 /**
@@ -2314,7 +2283,6 @@ async function watchSubagent(
       doneId: running.id,
       maxMs: getSubagentMaxMs(),
       sessionFile,
-      sentinelFile: running.sentinelFile,
       onTick() {
         // ponytail: observeRunningSubagent also runs from the status interval,
         // so it reads each subagent's activity file twice a second. Accepted:
@@ -2617,7 +2585,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
                   ...(result.structuredOutput !== undefined ? { structuredOutput: result.structuredOutput } : {}),
                   ...(result.structuredOutputError ? { structuredOutputError: result.structuredOutputError } : {}),
@@ -2933,9 +2900,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // A session recorded under a non-pi runner (cli: claude, before sub-agents
         // were pi-only) is refused: resuming it would relaunch that runner.
-        if (loadout.cli && loadout.cli !== "pi") {
-          const err = `Cannot resume "${requestedName}": it ran under cli: ${loadout.cli}, and sub-agents only run pi. Re-run the task as a fresh subagent.`;
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        const runnerRefusal = resumeRunnerRefusal(requestedName, loadout);
+        if (runnerRefusal) {
+          return { content: [{ type: "text" as const, text: runnerRefusal }], details: { error: runnerRefusal } };
         }
 
         // Resume with the snapshot's policies plus whatever is configured now, so

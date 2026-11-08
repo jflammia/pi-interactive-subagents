@@ -312,21 +312,23 @@ for (const backend of backends) {
     }
 
     it("closes the pane it opened when the spawn fails", async () => {
-      // The `Unknown CLI runner` throw fires ~60 lines after createSurface, so
-      // a bad `cli:` value used to leave an orphan pane with no owner —
-      // nothing tracks it until the subagent reaches runningSubagents.
+      // A throw after createSurface used to leave an orphan pane with no owner:
+      // nothing tracks it until the subagent reaches runningSubagents. The
+      // injected launch fault fires right after the pane is created.
       const dir = mkdtempSync(join(tmpdir(), "pi-leak-"));
       const agentsDir = join(dir, ".pi", "agents");
       mkdirSync(agentsDir, { recursive: true });
       writeFileSync(
         join(agentsDir, "bad-cli-agent.md"),
-        ["---", "name: bad-cli-agent", "cli: nope", "---", "", "body", ""].join("\n"),
+        ["---", "name: bad-cli-agent", "---", "", "body", ""].join("\n"),
       );
 
       const before = paneIds();
       const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
       process.env.PI_CODING_AGENT_DIR = join(dir, ".pi");
       try {
+        (subagentsModule as any).__test__.setLaunchFaultForTests("injected launch fault");
+        try {
         await assert.rejects(
           () =>
             (subagentsModule as any).__test__.launchSubagent(
@@ -340,8 +342,11 @@ for (const backend of backends) {
                 },
               },
             ),
-          /Unknown CLI runner/,
+          /injected launch fault/,
         );
+        } finally {
+          (subagentsModule as any).__test__.setLaunchFaultForTests(null);
+        }
       } finally {
         if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -391,12 +396,12 @@ for (const backend of backends) {
       }
     }
 
-    it("refuses cli: + tools: at the real spawn, before opening anything", async () => {
+    it("refuses a cli: runner at the real spawn, before opening anything", async () => {
       // The guard is only useful if launchSubagent actually calls it.
       const before = paneIds();
       await assert.rejects(
         () => launchWith(["cli: claude", "tools: read, bash"], "cli-tools-agent"),
-        /Refusing the spawn/,
+        /declares cli: claude.*only run pi/,
       );
       await sleep(600);
       assert.deepEqual(
@@ -432,12 +437,14 @@ for (const backend of backends) {
       mkdirSync(agentsDir, { recursive: true });
       writeFileSync(
         join(agentsDir, "wt-bad-cli.md"),
-        ["---", "name: wt-bad-cli", "worktree: true", "cli: nope", "---", "", "body", ""].join("\n"),
+        ["---", "name: wt-bad-cli", "worktree: true", "---", "", "body", ""].join("\n"),
       );
 
       const prev = process.env.PI_CODING_AGENT_DIR;
       process.env.PI_CODING_AGENT_DIR = join(repo, ".pi");
       try {
+        (subagentsModule as any).__test__.setLaunchFaultForTests("injected launch fault");
+        try {
         await assert.rejects(
           () =>
             (subagentsModule as any).__test__.launchSubagent(
@@ -451,8 +458,11 @@ for (const backend of backends) {
                 },
               },
             ),
-          /Unknown CLI runner/,
+          /injected launch fault/,
         );
+        } finally {
+          (subagentsModule as any).__test__.setLaunchFaultForTests(null);
+        }
 
         // The worktree directory must be gone, and its work preserved on a branch.
         const listed = execFileSync("git", ["worktree", "list", "--porcelain"], {
@@ -562,15 +572,17 @@ for (const backend of backends) {
       const agentsDir = join(repo, ".pi", "agents");
       mkdirSync(agentsDir, { recursive: true });
       // No `worktree:` key at all — the override is the only thing that can
-      // cause isolation here. `cli: nope` makes the spawn fail fast.
+      // cause isolation here. The injected launch fault makes the spawn fail fast.
       writeFileSync(
         join(agentsDir, "plain-agent.md"),
-        ["---", "name: plain-agent", "cli: nope", "---", "", "body", ""].join("\n"),
+        ["---", "name: plain-agent", "---", "", "body", ""].join("\n"),
       );
 
       const prev = process.env.PI_CODING_AGENT_DIR;
       process.env.PI_CODING_AGENT_DIR = join(repo, ".pi");
       try {
+        (subagentsModule as any).__test__.setLaunchFaultForTests("injected launch fault");
+        try {
         await assert.rejects(
           () =>
             (subagentsModule as any).__test__.launchSubagent(
@@ -585,8 +597,11 @@ for (const backend of backends) {
               },
               { worktree: true },
             ),
-          /Unknown CLI runner/,
+          /injected launch fault/,
         );
+        } finally {
+          (subagentsModule as any).__test__.setLaunchFaultForTests(null);
+        }
 
         // The override really created (and then cleaned up) a worktree: the
         // branch is the evidence that survives.
@@ -603,47 +618,6 @@ for (const backend of backends) {
         if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prev;
         rmSync(repo, { recursive: true, force: true });
-      }
-    });
-
-    it("reports a cli: claude child's own final message, not its screen", async () => {
-      // The Stop hook's sentinel file is the only place the agent's real final
-      // message lives. Falling back to the 200-line pane scrape hands the
-      // orchestrator terminal noise and defeats output-schema validation.
-      const dir = mkdtempSync(join(tmpdir(), "pi-claude-final-"));
-      const surface = createTrackedSurface(env, "claude-final-probe");
-      await sleep(900);
-
-      try {
-        const sentinelFile = join(dir, "sentinel");
-        writeFileSync(sentinelFile, "  CLAUDE FINAL ANSWER\n");
-
-        const running = {
-          id: "claudefinal",
-          name: "claude-final-probe",
-          task: "whatever",
-          surface,
-          startTime: Date.now(),
-          sessionFile: join(dir, "never.jsonl"),
-          cli: "claude",
-          sentinelFile,
-          interactive: false,
-          statusState: null as any,
-        };
-
-        const result = await (subagentsModule as any).__test__.watchSubagent(
-          running,
-          new AbortController().signal,
-        );
-
-        assert.equal(
-          result.summary,
-          "CLAUDE FINAL ANSWER",
-          `the sentinel's contents are the result, got: ${JSON.stringify(result.summary)}`,
-        );
-      } finally {
-        untrackSurface(env, surface);
-        rmSync(dir, { recursive: true, force: true });
       }
     });
 

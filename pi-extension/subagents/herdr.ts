@@ -921,7 +921,6 @@ export async function pollForExit(
     /** The subagent's id — keys the run-unique exit sentinel. */
     doneId: string;
     sessionFile?: string;
-    sentinelFile?: string;
     /** Give up after this long. Default 6h; a subagent is never infinite. */
     maxMs?: number;
     onTick?: (elapsed: number) => void;
@@ -961,15 +960,6 @@ export async function pollForExit(
           const data = JSON.parse(readFileSync(exitFile, "utf-8"));
           rmSync(exitFile, { force: true });
           return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
     }

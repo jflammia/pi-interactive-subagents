@@ -218,7 +218,7 @@ export interface SubagentLoadout {
   outputSchema: unknown | null;
   /** Whether this subagent runs in an isolated git worktree. */
   worktree: boolean;
-  /** CLI runner: "pi" (default) or "claude". */
+  /** CLI runner recorded at spawn: always "pi" or null now; any other value is refused on resume. */
   cli: string | null;
   /**
    * Resolved `-e` paths of the extensions that register the model's provider
