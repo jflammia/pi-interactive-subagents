@@ -273,8 +273,16 @@ const AGENT_SOURCE = "custom:pi-subagents";
 
 export type AgentReportState = "working" | "idle" | "blocked" | "unknown";
 
-/** herdr ignores stale reports from the same source by sequence number. */
-let reportSeq = 0;
+/**
+ * herdr drops a report whose `--seq` is not newer than the last one from the same source (a u64,
+ * `herdr api schema`). A fresh process (a restart or `/reload` of the parent while its subagent
+ * panes live on) must not start below the previous process's numbers, so seed from the wall clock
+ * in microseconds, as herdr's own pi integration does.
+ */
+function firstReportSeq(): number {
+  return Date.now() * 1000;
+}
+let reportSeq = firstReportSeq();
 
 /**
  * The one name shape a subagent uses everywhere: herdr's agent-label pattern,
@@ -895,7 +903,7 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export const __pollForExitTest__ = { interpretExitSidecar, firstReportSeq };
 
 /** Socket-level internals, exposed so the failure modes can be tested. */
 export const __herdrApiTest__ = {
@@ -921,6 +929,12 @@ export async function pollForExit(
     /** The subagent's id — keys the run-unique exit sentinel. */
     doneId: string;
     sessionFile?: string;
+    /**
+     * Whether the child itself recorded a finished run (its activity file's phase is "done", written
+     * atomically only at a real auto-exit, never while it waits on a question or on children). A pane
+     * that is gone then was closed after the subagent answered, not lost mid-run.
+     */
+    childFinished?: () => boolean;
     /** Give up after this long. Default 6h; a subagent is never infinite. */
     maxMs?: number;
     onTick?: (elapsed: number) => void;
@@ -974,6 +988,11 @@ export async function pollForExit(
     // lose the pane before the watch re-arms — so only conclude this after a
     // full pass of the sidecar checks above has also come up empty.
     if (paneGoneAt !== null && Date.now() - paneGoneAt > 2 * options.interval) {
+      let finished = false;
+      try {
+        finished = options.childFinished?.() === true;
+      } catch {}
+      if (finished) return { reason: "done", exitCode: 0 };
       return {
         reason: "error",
         exitCode: 1,

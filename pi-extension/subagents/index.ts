@@ -1756,6 +1756,18 @@ function registryEntryFor(running: {
  * (a literal 0 restores the bug), and that call site is unreachable from a
  * unit test. With no seam there is nothing for a caller to get wrong.
  */
+/**
+ * The child's own record that this run finished: its activity file says phase "done". The child
+ * writes that atomically (temp file + rename) only when it auto-exits; a run waiting on an
+ * ask_question or on its own children is "waiting", and a resumed run starts a fresh file under a
+ * new id, so an earlier run's finish never counts.
+ */
+function childRecordedDone(running: Pick<RunningSubagent, "activityFile" | "id">): boolean {
+  if (!running.activityFile) return false;
+  const read = readSubagentActivityFile(running.activityFile, running.id);
+  return read.ok && read.activity.phase === "done";
+}
+
 function childFinalMessage(running: {
   sessionFile: string;
   seededLines?: number;
@@ -1786,6 +1798,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 let launchFaultForTests: string | null = null;
 
 export const __test__ = {
+  childRecordedDone,
   setLaunchFaultForTests(message: string | null) {
     launchFaultForTests = message;
   },
@@ -2283,6 +2296,7 @@ async function watchSubagent(
       doneId: running.id,
       maxMs: getSubagentMaxMs(),
       sessionFile,
+      childFinished: () => childRecordedDone(running),
       onTick() {
         // ponytail: observeRunningSubagent also runs from the status interval,
         // so it reads each subagent's activity file twice a second. Accepted:

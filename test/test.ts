@@ -3999,6 +3999,62 @@ describe("pollForExit tick callbacks cannot kill the subagent they observe", () 
   });
 });
 
+describe("a pane closed after the subagent finished is a result, not a crash", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function recorded(build: (r: ReturnType<typeof createSubagentActivityRecorder>) => void) {
+    const dir = mkdtempSync(join(tmpdir(), "panegone-"));
+    const activityFile = join(dir, "child.json");
+    const recorder = createSubagentActivityRecorder({ runningChildId: "child", activityFile });
+    build(recorder);
+    return { dir, running: { id: "child", activityFile } };
+  }
+
+  it("only the child's own 'done' record counts: not waiting on a question, not mid-run, not another run's", () => {
+    const cases: Array<[string, (r: any) => void, boolean]> = [
+      ["auto-exited", (r) => { r.agentStart(); r.agentEndDone(); }, true],
+      ["mid-run", (r) => { r.agentStart(); }, false],
+      ["parked on ask_question", (r) => { r.agentStart(); r.askQuestion(); r.agentEndWaiting(); }, false],
+      ["parked waiting on its children", (r) => { r.agentStart(); r.agentEndWaiting(); }, false],
+    ];
+    for (const [label, build, expected] of cases) {
+      const { dir, running } = recorded(build);
+      try {
+        assert.equal(testApi.childRecordedDone(running), expected, label);
+        // A different run id (a resume) never reads this run's finish.
+        if (expected) assert.equal(testApi.childRecordedDone({ ...running, id: "resumed" }), false, `${label}: other run`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    assert.equal(testApi.childRecordedDone({ id: "x" }), false, "no activity file");
+  });
+
+  it("pollForExit: pane gone + child finished is done; pane gone otherwise is still an error", async () => {
+    for (const [childFinished, reason] of [[() => true, "done"], [() => false, "error"], [() => { throw new Error("torn"); }, "error"]] as const) {
+      const result = await pollForExit(surfaceThatDoesNotExist(), new AbortController().signal, {
+        interval: 20,
+        doneId: `panegone-${reason}`,
+        maxMs: 5000,
+        childFinished,
+      });
+      assert.equal(result.reason, reason);
+      if (reason === "error") assert.match(result.errorMessage ?? "", /pane disappeared/);
+      else assert.equal(result.exitCode, 0);
+    }
+  });
+});
+
+describe("herdr report sequence numbers survive a parent restart", () => {
+  it("starts above any earlier process's numbers (herdr drops a report whose --seq is not newer)", () => {
+    const { firstReportSeq } = __pollForExitTest__;
+    const before = Date.now() * 1000;
+    const seq = firstReportSeq();
+    assert.ok(seq >= before, "seeded from the wall clock in microseconds, like herdr's own pi integration");
+    assert.ok(Number.isSafeInteger(seq));
+  });
+});
+
 /** A pane id no herdr session will have, so the sentinel watch just errors. */
 function surfaceThatDoesNotExist(): string {
   return "w99:p99";
