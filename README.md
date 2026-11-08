@@ -265,6 +265,26 @@ Extensions can register additional tools for sub-agents at runtime via `register
 - A pi built-in provider (`getBuiltinProviders()` from `@earendil-works/pi-ai/providers/all`) is never refused, even when an extension re-registers it in the parent: the child uses pi's own provider. An extension that only wraps or filters a built-in (for example one that hides some models) therefore does not run in the child. If the extension *adds* models to a built-in provider, or changes its endpoint or auth, the child does not get them; map the provider to the extension to load it back.
 - The resolved path is part of the loadout snapshot, so resume loads the same provider. Resume is refused, before a pane exists, if that path is gone.
 
+### Policy extensions in every sub-agent
+
+`--no-extensions` also drops extensions that enforce a policy rather than add a provider, for example a gate that hides or refuses some models. A restricted sub-agent would then run without the policy its parent enforces. List such extensions in `subagents.policyExtensions` and every restricted **pi** sub-agent loads them with `-e`, whatever its model:
+
+```json
+{
+  "subagents": {
+    "policyExtensions": [
+      "git:git.blueshift.xyz/blueshift/pi-anthropic-gate",
+      "git:git@git.blueshift.xyz:blueshift/pi-openai-gate"
+    ]
+  }
+}
+```
+
+- Each entry is resolved like a `providerExtensions` value: a user-scope pi package source, or `builtin:<name>`.
+- An entry that is not installed is refused at spawn, before a pane exists. It is never skipped, because a child without its policy would run unchecked.
+- `--tools` still bounds every tool the child can call. Unrestricted spawns already keep every extension, and `cli:` runners run no pi extensions, so neither needs this.
+- The resolved paths are part of the loadout snapshot. Resume is refused if one of them is gone.
+
 ## Role folders
 
 `cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:

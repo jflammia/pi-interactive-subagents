@@ -1522,6 +1522,76 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("loadSubagentPolicyExtensions reads the always-loaded policy list", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      assert.deepEqual(testApi.loadSubagentPolicyExtensions(), [], "no settings file");
+      writeSettingsFile(globalDir, {
+        subagents: {
+          policyExtensions: [
+            " git:git.blueshift.xyz/blueshift/pi-anthropic-gate ",
+            "git:git@git.blueshift.xyz:blueshift/pi-openai-gate",
+            "git:git.blueshift.xyz/blueshift/pi-anthropic-gate", // duplicate
+            "", "   ", 42, null, { source: "x" }, // dropped: nothing a child could load
+          ],
+        },
+      });
+      assert.deepEqual(testApi.loadSubagentPolicyExtensions(), [
+        "git:git.blueshift.xyz/blueshift/pi-anthropic-gate",
+        "git:git@git.blueshift.xyz:blueshift/pi-openai-gate",
+      ]);
+      for (const bad of ["pi-anthropic-gate", { a: 1 }, null]) {
+        writeSettingsFile(globalDir, { subagents: { policyExtensions: bad } });
+        assert.deepEqual(testApi.loadSubagentPolicyExtensions(), [], JSON.stringify(bad));
+      }
+    });
+  });
+
+  it("planPolicyExtensions loads every policy into a restricted child, whatever its model", () => {
+    const sources = ["git:example/gate-a", "git:example/gate-b"];
+    const resolveSource = (s: string) => `/pkgs/${s.split("/").pop()}`;
+    assert.deepEqual(testApi.planPolicyExtensions({ restricted: true, sources, resolveSource }), {
+      paths: ["/pkgs/gate-a", "/pkgs/gate-b"],
+    });
+    // Unrestricted children keep every extension already; cli runners run no pi extensions.
+    assert.deepEqual(testApi.planPolicyExtensions({ restricted: false, sources, resolveSource }), { paths: [] });
+    // A policy that does not resolve is refused, never skipped: a child without its gate would run unchecked.
+    const missing = testApi.planPolicyExtensions({ restricted: true, sources, resolveSource: (s: string) => (s.endsWith("b") ? undefined : "/pkgs/a") });
+    assert.ok("error" in missing);
+    assert.match(missing.error, /subagents\.policyExtensions lists "git:example\/gate-b".*not installed.*pi install git:example\/gate-b/);
+  });
+
+  it("applySandboxToParts loads policy extensions into a restricted child, deduped with provider ones", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "reviewer",
+          toolAllowlist: "read",
+          model: "openrouter/qwen/qwen3.7-flash",
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+          providerExtensions: ["/pkgs/gate-a"],
+          policyExtensions: ["/pkgs/gate-a", "/pkgs/gate-b"],
+        },
+        { artifactDir: d, name: "reviewer" },
+      );
+      const loaded = parts.flatMap((p, i) => (parts[i - 1] === "-e" ? [p.replace(/'/g, "")] : []));
+      assert.deepEqual(loaded.filter((p) => p.startsWith("/pkgs/")), ["/pkgs/gate-a", "/pkgs/gate-b"]);
+      assert.ok(parts.includes("--no-extensions"), "the default-deny restriction stays");
+    });
+  });
+
+  it("missingProviderExtensionPaths also reports a policy extension removed since spawn", () => {
+    const loadout = { providerExtensions: null, policyExtensions: ["/nonexistent/gate", "builtin:mcp"] };
+    assert.deepEqual(testApi.missingProviderExtensionPaths(loadout), ["/nonexistent/gate"]);
+  });
+
   it("planProviderExtensions loads a mapped provider's extension into a restricted child", () => {
     const plan = testApi.planProviderExtensions({
       model: "claude-code/claude-sonnet-5-5",

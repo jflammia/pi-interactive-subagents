@@ -226,6 +226,11 @@ export interface SubagentLoadout {
    * in snapshots written before this field existed, which loaded none.
    */
   providerExtensions?: string[] | null;
+  /**
+   * Resolved `-e` paths of the policy extensions (`subagents.policyExtensions`)
+   * loaded into every restricted child. Absent in older snapshots.
+   */
+  policyExtensions?: string[] | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

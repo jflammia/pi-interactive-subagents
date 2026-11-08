@@ -547,6 +547,63 @@ function loadSubagentProviderExtensions(): Record<string, string> {
 }
 
 /**
+ * Read `subagents.policyExtensions` from the pi settings file: pi package
+ * sources (or `builtin:<name>`) loaded into EVERY restricted pi child,
+ * whatever its model. They are policy, not providers — e.g. a gate that hides
+ * or refuses models — and `--no-extensions` would otherwise drop them, letting
+ * a child bypass the policy its parent enforces. `--tools` still bounds what
+ * the child can call. Entries that are not non-empty strings are dropped;
+ * duplicates are removed, order kept.
+ */
+function loadSubagentPolicyExtensions(): string[] {
+  const settingsPath = join(getAgentConfigDir(), "settings.json");
+  if (!existsSync(settingsPath)) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, "utf8")) as unknown;
+  } catch {
+    return [];
+  }
+  const subagents = (parsed as { subagents?: unknown } | null)?.subagents;
+  const list = (subagents as { policyExtensions?: unknown } | null)?.policyExtensions;
+  if (!Array.isArray(list)) return [];
+  const result: string[] = [];
+  for (const source of list) {
+    if (typeof source !== "string" || !source.trim()) continue;
+    if (!result.includes(source.trim())) result.push(source.trim());
+  }
+  return result;
+}
+
+/**
+ * The policy extensions a pi subagent loads, or why it cannot launch. Only a
+ * restricted child (`--no-extensions`) needs them; an unrestricted one keeps
+ * every extension. A policy that does not resolve is refused, never skipped:
+ * a child without its gate would run unchecked.
+ */
+function planPolicyExtensions(input: {
+  restricted: boolean;
+  sources: readonly string[];
+  resolveSource?: (source: string) => string | undefined;
+}): { paths: string[] } | { error: string } {
+  if (!input.restricted) return { paths: [] };
+  const paths: string[] = [];
+  for (const source of input.sources) {
+    const path = (input.resolveSource ?? resolveProviderExtensionSource)(source);
+    if (!path) {
+      return {
+        error:
+          `subagents.policyExtensions lists "${source}", which is not installed, so a restricted ` +
+          `subagent would run without that policy. Install it with \`pi install ${source}\`, ` +
+          `or remove it from settings.json.`,
+      };
+    }
+    paths.push(path);
+  }
+  return { paths };
+}
+
+/**
  * Resolve a `providerExtensions` value to what `pi -e` accepts. `builtin:<name>`
  * passes through (pi resolves it); anything else is a package source or path,
  * resolved through pi's own package manager to the user-scope install path —
@@ -595,8 +652,10 @@ function modelProviderId(model: string | undefined, knownProviderIds: readonly s
  * and starts without that provider, so the child would fail after its pane
  * opened. `builtin:` entries are not paths.
  */
-function missingProviderExtensionPaths(loadout: Pick<SubagentLoadout, "providerExtensions">): string[] {
-  return (loadout.providerExtensions ?? []).filter((p) => !p.startsWith("builtin:") && !existsSync(p));
+function missingProviderExtensionPaths(loadout: Pick<SubagentLoadout, "providerExtensions" | "policyExtensions">): string[] {
+  return [...(loadout.providerExtensions ?? []), ...(loadout.policyExtensions ?? [])].filter(
+    (p) => !p.startsWith("builtin:") && !existsSync(p),
+  );
 }
 
 /**
@@ -669,6 +728,17 @@ function providerExtensionPlanFor(
     extensionProviderIds: extensionProviderIdsOf(ctx),
     map: restricted ? loadSubagentProviderExtensions() : {},
   });
+}
+
+/**
+ * The policy-extension plan for one pi spawn: every `subagents.policyExtensions`
+ * entry for a restricted child; nothing for an unrestricted one or a `cli:` runner.
+ */
+function policyExtensionPlanFor(agentDefs: AgentDefaults | null): { paths: string[] } | { error: string } {
+  if (agentDefs?.cli && agentDefs.cli !== "pi") return { paths: [] };
+  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  const restricted = buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning }) !== null;
+  return planPolicyExtensions({ restricted, sources: restricted ? loadSubagentPolicyExtensions() : [] });
 }
 
 /** Provider ids registered by extensions in this pi process (empty when unknown). */
@@ -1232,6 +1302,11 @@ function applySandboxToParts(
     for (const extPath of loadout.providerExtensions ?? []) {
       extPaths.add(extPath);
     }
+    // Policy extensions (subagents.policyExtensions) load into every restricted
+    // child so it enforces the same policy as its parent.
+    for (const extPath of loadout.policyExtensions ?? []) {
+      extPaths.add(extPath);
+    }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
@@ -1706,6 +1781,9 @@ export const __test__ = {
   providerExtensionPlanFor,
   modelProviderId,
   missingProviderExtensionPaths,
+  loadSubagentPolicyExtensions,
+  planPolicyExtensions,
+  policyExtensionPlanFor,
   buildSubagentToolAllowlist,
   assertCliToolsCompatible,
   startWidgetRefresh,
@@ -1819,6 +1897,8 @@ async function launchSubagentInner(
   assertCliToolsCompatible(params.agent ?? "subagent", agentDefs?.cli, effectiveTools);
   const providerPlan = providerExtensionPlanFor(params, agentDefs, ctx);
   if ("error" in providerPlan) throw new Error(providerPlan.error);
+  const policyPlan = policyExtensionPlanFor(agentDefs);
+  if ("error" in policyPlan) throw new Error(policyPlan.error);
   const effectiveSkills = agentDefs?.skills;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
@@ -2014,6 +2094,7 @@ async function launchSubagentInner(
     worktree: agentDefs?.worktree ?? false,
     cli: agentDefs?.cli ?? null,
     providerExtensions: providerPlan.paths.length > 0 ? providerPlan.paths : null,
+    policyExtensions: policyPlan.paths.length > 0 ? policyPlan.paths : null,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -3213,9 +3294,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        const batchProblem = findBatchSpawnProblem(params.tasks, loadAgentDefaults, (p, defs) =>
-          providerExtensionPlanFor(p, defs, ctx),
-        );
+        const batchProblem = findBatchSpawnProblem(params.tasks, loadAgentDefaults, (p, defs) => {
+          const providerPlan = providerExtensionPlanFor(p, defs, ctx);
+          if ("error" in providerPlan) return providerPlan;
+          const policyPlan = policyExtensionPlanFor(defs);
+          return "error" in policyPlan ? policyPlan : { paths: [...providerPlan.paths, ...policyPlan.paths] };
+        });
         if (batchProblem) {
           return {
             content: [{ type: "text" as const, text: batchProblem }],
