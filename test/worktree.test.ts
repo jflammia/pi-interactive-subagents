@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createWorktree, finishWorktree, listSubagentWorktrees, worktreeNote } from "../pi-extension/subagents/worktree.ts";
+import { createWorktree, finishWorktree, listSubagentWorktrees, reopenWorktree, worktreeNote } from "../pi-extension/subagents/worktree.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 function hasGit(): boolean {
@@ -316,5 +316,26 @@ test("listSubagentWorktrees returns empty array outside a git repo", () => {
     assert.deepEqual(listed, []);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("reopenWorktree puts a finished subagent's checkout back on its kept branch (resume)", { skip: !hasGit() }, () => {
+  const repo = makeRepo();
+  try {
+    const wt = createWorktree(repo, "resumable");
+    writeFileSync(join(wt, "work.txt"), "done\n");
+    const outcome = finishWorktree(wt);
+    assert.ok(outcome);
+    assert.equal(existsSync(wt), false, "finish removes the checkout");
+    assert.equal(reopenWorktree(wt), true);
+    assert.equal(existsSync(join(wt, "work.txt")), true, "the branch's committed work is back");
+    assert.equal(execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: wt, encoding: "utf8" }).trim(), outcome.branch);
+    assert.equal(reopenWorktree(wt), true, "already there: nothing to do");
+    // Not a subagent worktree path, or its branch is gone: refuse, change nothing.
+    assert.equal(reopenWorktree(join(repo, "elsewhere", "x")), false);
+    assert.equal(reopenWorktree(join(repo, ".pi", "worktrees", "no-such-branch")), false);
+    assert.equal(existsSync(join(repo, ".pi", "worktrees", "no-such-branch")), false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
   }
 });

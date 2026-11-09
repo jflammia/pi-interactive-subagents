@@ -69,7 +69,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { createWorktree, finishWorktree, worktreeNote } from "./worktree.ts";
+import { createWorktree, finishWorktree, reopenWorktree, worktreeNote } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -2955,9 +2955,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumedPlacement = loadout.agent
           ? loadAgentDefaults(loadout.agent)?.panePlacement
           : undefined;
-        // The recorded cwd can be gone — a worktree subagent's checkout is
-        // removed on completion (its work lives on the branch). Fall back to
-        // the parent's cwd rather than failing the split on a dead path.
+        // A worktree subagent's checkout is removed on completion, but its branch is kept.
+        // Re-add it there: pi resumes in the session's recorded cwd and otherwise stops at its
+        // interactive "cwd from session file does not exist" prompt, which no one answers. The
+        // resumed run is then a worktree run again, so finishWorktree commits and removes it.
+        const reopenedWorktree = loadout.worktree && loadout.cwd ? reopenWorktree(loadout.cwd) : false;
+        // Any other recorded cwd that is gone: fall back to the parent's cwd rather than failing
+        // the split on a dead path.
         const resumeCwd = loadout.cwd && existsSync(loadout.cwd) ? loadout.cwd : undefined;
         const surface = createSurface(name, resumedPlacement, resumeCwd);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -3056,6 +3060,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          ...(reopenedWorktree && loadout.cwd ? { worktreePath: loadout.cwd } : {}),
           // The loadout has recorded this since spawn but nothing read it
           // back, so a resumed agent's schema violations went unreported.
           ...(loadout.outputSchema ? { outputSchema: loadout.outputSchema } : {}),

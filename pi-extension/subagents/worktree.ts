@@ -19,8 +19,8 @@
  * fall back to a shared cwd (that would defeat the isolation guarantee).
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { basename } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 
 function git(args: string[], opts: { cwd: string }): string {
   return execFileSync("git", args, {
@@ -69,6 +69,33 @@ export function createWorktree(repoCwd: string, name: string): string {
   git(["worktree", "add", "-b", branchName, worktreePath, "HEAD"], { cwd: repoRoot });
 
   return worktreePath;
+}
+
+/**
+ * Put a finished subagent's worktree back so the subagent can be resumed in it.
+ *
+ * `finishWorktree` removes the checkout but keeps its branch, and pi resumes a session in the cwd
+ * its file records, so resuming would stop at pi's interactive "cwd from session file does not
+ * exist" prompt. The path and branch come from `createWorktree`'s layout
+ * (`<repo>/.pi/worktrees/<id>` on `pi-subagent/<id>`). Returns true when the checkout exists
+ * afterwards (it was still there, or it was re-added on its branch). Returns false, changing
+ * nothing, for any other path or a branch that is gone.
+ */
+export function reopenWorktree(worktreePath: string): boolean {
+  if (existsSync(worktreePath)) return true;
+  const id = basename(worktreePath);
+  const worktreesDir = dirname(worktreePath);
+  if (basename(worktreesDir) !== "worktrees" || basename(dirname(worktreesDir)) !== ".pi") return false;
+  const repoRoot = dirname(dirname(worktreesDir));
+  const branch = `pi-subagent/${id}`;
+  try {
+    git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repoRoot });
+    git(["worktree", "prune"], { cwd: repoRoot });
+    git(["worktree", "add", worktreePath, branch], { cwd: repoRoot });
+    return existsSync(worktreePath);
+  } catch {
+    return false;
+  }
 }
 
 /**
