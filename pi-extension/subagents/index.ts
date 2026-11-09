@@ -1758,7 +1758,10 @@ function registryEntryFor(running: {
  */
 /**
  * The child's own record that this run finished: its activity file (written atomically, temp file
- * + rename) says phase "done" from agent_end, the auto-exit. A run waiting on an ask_question or on
+ * + rename) says phase "done" from agent_end, the auto-exit. That is exactly the decision the
+ * auto-exit path itself made (subagent-done.ts shouldExit), so a pane gone after it reports what
+ * the sentinel would have; it inherits that decision's limits and adds none. Runs without
+ * auto-exit never record it, and a gone pane stays an error for them, as before. A run waiting on an ask_question or on
  * its children is "waiting"; a resumed run starts a fresh file under a new id, so an earlier run's
  * finish never counts. If the recorder disabled itself after repeated write failures, the finish is
  * not recorded and the pane-gone case stays an error: fail closed.
