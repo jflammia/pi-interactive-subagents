@@ -4016,6 +4016,12 @@ describe("a pane closed after the subagent finished is a result, not a crash", (
       ["mid-run", (r) => { r.agentStart(); }, false],
       ["parked on ask_question", (r) => { r.agentStart(); r.askQuestion(); r.agentEndWaiting(); }, false],
       ["parked waiting on its children", (r) => { r.agentStart(); r.agentEndWaiting(); }, false],
+      // Closing the pane SIGHUPs pi, which emits session_shutdown("quit"): never a finish.
+      ["quit mid-run (pane closed)", (r) => { r.agentStart(); r.sessionShutdown("quit"); }, false],
+      ["quit while parked on a question", (r) => { r.agentStart(); r.askQuestion(); r.agentEndWaiting(); r.sessionShutdown("quit"); }, false],
+      ["quit while parked on children", (r) => { r.agentStart(); r.agentEndWaiting(); r.sessionShutdown("quit"); }, false],
+      ["quit before it started", (r) => { r.sessionShutdown("quit"); }, false],
+      ["auto-exited, then the pane closed", (r) => { r.agentStart(); r.agentEndDone(); r.sessionShutdown("quit"); }, true],
     ];
     for (const [label, build, expected] of cases) {
       const { dir, running } = recorded(build);
@@ -4028,6 +4034,26 @@ describe("a pane closed after the subagent finished is a result, not a crash", (
       }
     }
     assert.equal(testApi.childRecordedDone({ id: "x" }), false, "no activity file");
+  });
+
+  it("pollForExit with the real predicate over a real activity file", async () => {
+    for (const [build, reason] of [
+      [(r: any) => { r.agentStart(); r.agentEndDone(); }, "done"],
+      [(r: any) => { r.agentStart(); r.sessionShutdown("quit"); }, "error"],
+    ] as const) {
+      const { dir, running } = recorded(build);
+      try {
+        const result = await pollForExit(surfaceThatDoesNotExist(), new AbortController().signal, {
+          interval: 20,
+          doneId: `real-${reason}`,
+          maxMs: 5000,
+          childFinished: () => testApi.childRecordedDone(running),
+        });
+        assert.equal(result.reason, reason);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
   });
 
   it("pollForExit: pane gone + child finished is done; pane gone otherwise is still an error", async () => {

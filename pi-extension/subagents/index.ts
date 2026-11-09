@@ -1757,15 +1757,20 @@ function registryEntryFor(running: {
  * unit test. With no seam there is nothing for a caller to get wrong.
  */
 /**
- * The child's own record that this run finished: its activity file says phase "done". The child
- * writes that atomically (temp file + rename) only when it auto-exits; a run waiting on an
- * ask_question or on its own children is "waiting", and a resumed run starts a fresh file under a
- * new id, so an earlier run's finish never counts.
+ * The child's own record that this run finished: its activity file (written atomically, temp file
+ * + rename) says phase "done" from agent_end, the auto-exit. A run waiting on an ask_question or on
+ * its children is "waiting"; a resumed run starts a fresh file under a new id, so an earlier run's
+ * finish never counts. If the recorder disabled itself after repeated write failures, the finish is
+ * not recorded and the pane-gone case stays an error: fail closed.
  */
 function childRecordedDone(running: Pick<RunningSubagent, "activityFile" | "id">): boolean {
   if (!running.activityFile) return false;
   const read = readSubagentActivityFile(running.activityFile, running.id);
-  return read.ok && read.activity.phase === "done";
+  // Only the auto-exit's own record: phase "done" set at agent_end (subagent-done.ts calls
+  // agentEndDone only when no question or child is pending). A graceful quit also sets "done"
+  // (activity.ts sessionShutdown), but its latestEvent is session_shutdown — and closing the pane
+  // is itself what makes pi quit, so that record says nothing about the run having finished.
+  return read.ok && read.activity.phase === "done" && read.activity.latestEvent === "agent_end";
 }
 
 function childFinalMessage(running: {
