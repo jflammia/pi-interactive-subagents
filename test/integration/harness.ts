@@ -176,14 +176,31 @@ export function createTestEnv(): TestEnv {
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  const env: TestEnv = { dir, surfaces: [], tempFiles: [] };
+  closeOnExit(env);
+  return env;
+}
+
+/**
+ * The parent closes what it opened even when it does not reach `after()`: a test process killed
+ * by a timeout or a signal used to leave every tracked pane open as an empty shell. `closeSurface`
+ * is synchronous (`execFileSync`), so it runs inside an `exit` handler; SIGINT/SIGTERM/SIGHUP
+ * exit through it.
+ */
+function closeOnExit(env: TestEnv): void {
+  process.once("exit", () => cleanupTestEnv(env));
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.once(signal, () => process.exit(128 + (signal === "SIGINT" ? 2 : signal === "SIGTERM" ? 15 : 1)));
+  }
 }
 
 /**
  * Clean up all resources created during the test.
  */
 export function cleanupTestEnv(env: TestEnv): void {
-  for (const surface of env.surfaces) {
+  const surfaces = env.surfaces;
+  env.surfaces = [];
+  for (const surface of surfaces) {
     try {
       closeSurface(surface);
     } catch {}
