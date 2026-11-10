@@ -22,8 +22,8 @@ import {
   sendLongCommand,
   paneBusy,
   pollForExit,
-  sentinelEcho,
   sentinelPattern,
+  exitTrailer,
   closeSurface,
   shellEscape,
   readScreen,
@@ -2145,9 +2145,12 @@ async function launchSubagentInner(
   // still rides on the command — PI_SUBAGENT_SURFACE is the pane id, which does
   // not exist until the split has already happened.
   const piCommand = envPrefix + parts.join(" ");
-  const command = `${piCommand}; ${sentinelEcho(id)}`;
+  const command = `${piCommand}\n${exitTrailer(id, subagentSessionFile)}`;
   const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  // `exec`: replace the pane's shell with this script, so the pane closes
+  // itself the moment the script ends (see sendLongCommand's `exec` doc and
+  // exitTrailer's doc for why the sentinel+sidecar+sleep stay readable first).
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
@@ -2156,6 +2159,7 @@ async function launchSubagentInner(
       `# Session: ${subagentSessionFile}`,
       `# Surface: ${surface}`,
     ].join("\n"),
+    exec: true,
   });
 
   const running: RunningSubagent = {
@@ -3028,9 +3032,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
+        // A stale `.exit` sidecar from this same session file's PREVIOUS run
+        // (left behind if that run's pollForExit happened to return via the
+        // sentinel branch before consuming it) must not short-circuit this
+        // resume: pollForExit's fast path would read it on its very first
+        // tick and report the resumed agent done before it has done anything.
+        // A fresh spawn can never hit this — subagentSessionFile there is a
+        // brand-new path every time — so only resume needs the guard.
+        //
+        // Safe to drop unconditionally: the only reader of this file is
+        // pollForExit's fast path (herdr.ts), reached only through
+        // watchSubagent(running, ...) — and nothing calls watchSubagent for
+        // THIS resume's `running` record before this point in the function.
+        // childRecordedDone, the other `childFinished` consumer, reads a
+        // separate activity file (activity.ts) and never touches `.exit` at
+        // all. So there is no legitimate consumer of the old sidecar this
+        // unlink could race past.
+        try {
+          unlinkSync(`${sessionPath}.exit`);
+        } catch {}
+
         // The pane was opened in the sub-agent's original cwd, so its tools
         // (safe_bash, edits) operate where they did before.
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; ${sentinelEcho(id)}`;
+        const command = `${resumeEnvPrefix}${parts.join(" ")}\n${exitTrailer(id, sessionPath)}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -3041,6 +3065,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
+        // `exec`: same rationale as the fresh-spawn launch script — the pane
+        // closes itself when this resumed run ends.
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
@@ -3050,6 +3076,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `# Surface: ${surface}`,
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
+          exec: true,
         });
 
         // Register as a running subagent for widget tracking

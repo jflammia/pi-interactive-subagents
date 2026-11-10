@@ -86,6 +86,8 @@ import {
   pollForExit,
   sentinelEcho,
   sentinelPattern,
+  exitTrailer,
+  sendLongCommand,
 } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
@@ -3967,6 +3969,92 @@ describe("herdr.ts exit sentinel is run-unique", () => {
   });
 });
 
+describe("herdr.ts exitTrailer closes the pane on its own", () => {
+  const id = "deadbeef";
+  const sessionFile = "/tmp/does-not-matter/session.jsonl";
+
+  it("contains the sentinel, a write-if-absent sidecar write, and a trailing exit", () => {
+    const script = exitTrailer(id, sessionFile);
+    // The sentinel echo, run-unique to this id.
+    assert.match(script, /echo '__SUBAGENT_DONE_deadbeef_'\$\?'__'/);
+    // The sidecar write is a shell no-op when the file is already there
+    // (`[ -f <exit file> ] ||`), so an error sidecar from subagent-done.ts's
+    // error path is never clobbered by this generic "done".
+    assert.match(script, /\[ -f '\/tmp\/does-not-matter\/session\.jsonl\.exit' \] \|\|/);
+    assert.match(script, /"type":"done","exitCode":/);
+    // The trailing sleep, so herdr's wait-output can see the sentinel before
+    // the shell (and the pane with it) exits.
+    assert.match(script, /sleep 2\s*$/);
+  });
+
+  it("shell-escapes the session file path so a sidecar path with a space or quote cannot break out", () => {
+    const script = exitTrailer(id, "/tmp/weird dir/it's a session.jsonl");
+    assert.match(script, /'\/tmp\/weird dir\/it'\\''s a session\.jsonl\.exit'/);
+  });
+
+  it("preserves the wrapped command's real exit code through the sentinel AND the sidecar", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "exittrailer-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const scriptPath = join(dir, "script.sh");
+      writeFileSync(
+        scriptPath,
+        ["#!/bin/bash", "(exit 42)", exitTrailer("realrun", sessionFile), ""].join("\n"),
+        { mode: 0o755 },
+      );
+      const out = execFileSync("bash", [scriptPath], { encoding: "utf8" });
+      assert.match(out, /__SUBAGENT_DONE_realrun_42__/);
+      const sidecar = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf-8"));
+      assert.deepEqual(sidecar, { type: "done", exitCode: 42 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never overwrites a sidecar the error path already wrote", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "exittrailer-error-wins-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: "boom" }));
+      const scriptPath = join(dir, "script.sh");
+      writeFileSync(
+        scriptPath,
+        ["#!/bin/bash", "(exit 0)", exitTrailer("errwins", sessionFile), ""].join("\n"),
+        { mode: 0o755 },
+      );
+      execFileSync("bash", [scriptPath], { encoding: "utf8" });
+      const sidecar = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf-8"));
+      assert.deepEqual(sidecar, { type: "error", errorMessage: "boom" }, "the error sidecar must win");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("sendLongCommand types `exec bash` when exec:true, so the pane's shell dies with the script", () => {
+  it("defaults to a plain `bash <script>` that leaves the shell alive", () => {
+    const scriptPath = join(mkdtempSync(join(tmpdir(), "sendlong-")), "cmd.sh");
+    assert.throws(
+      () => sendLongCommand(surfaceThatDoesNotExist(), "echo hi", { scriptPath }),
+      (err: any) => {
+        assert.match(String(err.message), /herdr pane run w99:p99 bash '.*cmd\.sh'/);
+        return true;
+      },
+    );
+  });
+
+  it("types `exec bash <script>` when exec is true, replacing the pane's shell", () => {
+    const scriptPath = join(mkdtempSync(join(tmpdir(), "sendlong-exec-")), "cmd.sh");
+    assert.throws(
+      () => sendLongCommand(surfaceThatDoesNotExist(), "echo hi", { scriptPath, exec: true }),
+      (err: any) => {
+        assert.match(String(err.message), /herdr pane run w99:p99 exec bash '.*cmd\.sh'/);
+        return true;
+      },
+    );
+  });
+});
+
 describe("pollForExit tick callbacks cannot kill the subagent they observe", () => {
   it("survives a throwing onTick and still returns the real exit", async () => {
     // onTick observes a LIVE subagent. A throw used to escape the poll loop
@@ -4068,6 +4156,121 @@ describe("a pane closed after the subagent finished is a result, not a crash", (
       if (reason === "error") assert.match(result.errorMessage ?? "", /pane disappeared/);
       else assert.equal(result.exitCode, 0);
     }
+  });
+
+  it("returns done with the real exit code from the shell-written `.exit` sidecar, even though the pane is gone", async () => {
+    // The pane that would carry the terminal sentinel never existed (the exec
+    // launch script already closed it, or it simply was never opened here),
+    // so this proves the fast-path sidecar read — not the sentinel watch — is
+    // what lets a vanished pane still report the real exit code.
+    const dir = mkdtempSync(join(tmpdir(), "exitsidecar-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", exitCode: 17 }));
+      const result = await pollForExit(surfaceThatDoesNotExist(), new AbortController().signal, {
+        interval: 20,
+        doneId: "realexitcode",
+        sessionFile,
+        maxMs: 5000,
+      });
+      assert.equal(result.reason, "done");
+      assert.equal(result.exitCode, 17);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a pre-existing error sidecar wins even when a 'done' sidecar also exists at poll time", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "exitsidecar-error-wins-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      // subagent-done.ts's error path writes first; exitTrailer's write-if-
+      // absent check means this file is never touched again by the script.
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: "Anthropic 529" }));
+      const result = await pollForExit(surfaceThatDoesNotExist(), new AbortController().signal, {
+        interval: 20,
+        doneId: "errorwins",
+        sessionFile,
+        maxMs: 5000,
+      });
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.equal(result.errorMessage, "Anthropic 529");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("pollForExit semantics: a lone stale .exit sidecar alone satisfies it as done (the bug a resume-time unlink must prevent)", async () => {
+    // This pins the FAILURE MODE a resume must avoid, not the fix itself: if
+    // nothing unlinks a leftover `.exit` sidecar from a session file's
+    // PREVIOUS run before pollForExit starts watching the NEW run on that
+    // same path, pollForExit's fast path finds it on tick 1 and reports
+    // "done" before the resumed pi has done anything. See the companion
+    // source-inspection test below, which pins that the resume handler in
+    // index.ts actually unlinks this file before building its launch
+    // command — that is the real guard; this test only establishes why it's
+    // needed.
+    const dir = mkdtempSync(join(tmpdir(), "resume-stale-sidecar-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", exitCode: 0 }));
+      const result = await pollForExit(surfaceThatDoesNotExist(), new AbortController().signal, {
+        interval: 20,
+        doneId: "staleresume",
+        sessionFile,
+        maxMs: 5000,
+      });
+      assert.equal(result.reason, "done", "a lone stale sidecar alone satisfies pollForExit");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the resume handler unlinks a stale .exit sidecar before relaunching (source-pinned, not re-derived)", () => {
+  // A fresh spawn always writes to a brand-new session file path
+  // (timestamp + several random segments, built in launchSubagentInner), so
+  // it can never inherit a previous run's sidecar and needs no such guard.
+  // Resume reuses the SAME session file path across runs, so it is the one
+  // place this matters. Asserting against the source text (rather than only
+  // against pollForExit's behavior, which a deleted guard would not change)
+  // ensures this test actually fails if the guard in index.ts is removed.
+  const indexSource = readFileSync(
+    fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
+    "utf-8",
+  );
+
+  it("calls unlinkSync on sessionPath + '.exit' inside the resume handler", () => {
+    assert.match(
+      indexSource,
+      /unlinkSync\(`\$\{sessionPath\}\.exit`\)/,
+      "expected the resume handler to unlink a stale .exit sidecar for sessionPath before relaunching",
+    );
+  });
+
+  it("the unlink appears before the resume command is built, so it always runs ahead of pollForExit watching this run", () => {
+    // Brittle by construction: this is a raw-text position check, not a
+    // control-flow proof. It passes if the literal text appears earlier in
+    // the file for ANY reason (including inside a comment) and breaks on a
+    // reorder or rename of the resume handler that changes nothing
+    // behaviorally. If this starts failing, re-pin it against the new shape
+    // of the handler rather than deleting it — the invariant it stands in
+    // for (nothing else calls watchSubagent for this resume's `running`
+    // record between the unlink and the launch, confirmed by grepping every
+    // watchSubagent(running, ...) call site and every `.exit` reader in the
+    // package — see the comment at the unlinkSync call site in index.ts) is
+    // still real and still needs a tripwire.
+    const unlinkIndex = indexSource.indexOf("unlinkSync(`${sessionPath}.exit`)");
+    const commandBuildIndex = indexSource.indexOf(
+      "const command = `${resumeEnvPrefix}${parts.join(\" \")}\\n${exitTrailer(id, sessionPath)}`;",
+    );
+    assert.ok(unlinkIndex > 0, "expected to find the unlink call");
+    assert.ok(commandBuildIndex > 0, "expected to find the resume command assembly");
+    assert.ok(
+      unlinkIndex < commandBuildIndex,
+      "the stale sidecar must be gone before the resume command (and its exitTrailer) exist, so a watcher started right after can never read a leftover from the previous run",
+    );
   });
 });
 

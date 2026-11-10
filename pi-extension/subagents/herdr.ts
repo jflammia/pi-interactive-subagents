@@ -649,12 +649,20 @@ export function sendCommand(surface: string, command: string): void {
  * stable path (for example under session artifacts) so the exact invocation is
  * preserved for debugging.
  *
+ * `options.exec`: type `exec bash <script>` instead of `bash <script>`. `exec`
+ * replaces the pane's interactive shell with the script's process rather than
+ * running it as a child, so when the script ends the shell is gone too and the
+ * pane closes itself — no live shell is left behind for a dead parent to leak.
+ * Launch scripts that drive a sub-agent's pane for its whole lifetime should
+ * pass this; ad-hoc one-off commands that expect to return to a shell prompt
+ * (most callers, including every integration test) should not.
+ *
  * Returns the script path.
  */
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; exec?: boolean },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -674,7 +682,8 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  const prefix = options?.exec ? "exec bash" : "bash";
+  sendCommand(surface, `${prefix} ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
@@ -795,6 +804,41 @@ export function sentinelPattern(id: string): string {
 }
 
 /**
+ * Shell fragment appended after a subagent's pi command, replacing the bare
+ * `sentinelEcho(id)` call used to be enough on its own: now the launch script
+ * execs into the pane's shell (see `sendLongCommand`'s `exec` option), so the
+ * pane closes itself the instant the script ends — nothing is left to call
+ * closeSurface() on a dead parent's behalf.
+ *
+ * Order matters here:
+ *  1. Capture the pi command's exit code into a variable — `$?` is clobbered
+ *     by every command that follows, so this is the only place it's readable.
+ *  2. Replay that code through a subshell immediately before the sentinel
+ *     echo, so sentinelEcho's own `$?` read (see sentinelEcho's `echo ...$?`)
+ *     reports the pi command's real exit status, not this fragment's.
+ *  3. Write the `.exit` sidecar — reusing the `{"type":"done",exitCode}`
+ *     shape subagent-done.ts's error path already writes for the same file,
+ *     so pollForExit's existing fast-path sidecar read (interpretExitSidecar)
+ *     needs no new file to watch. Write only if absent: an error-path sidecar
+ *     already on disk recorded a real stopReason="error" and must win over
+ *     this generic "done".
+ *  4. `sleep 2` so herdr's `pane wait-output` — which polls server-side, not
+ *     continuously — has time to observe the sentinel line before the shell
+ *     (and the pane with it) is gone. Verified empirically: without this
+ *     sleep, `exec`ing a script that prints the sentinel and returns closes
+ *     the pane before a wait-output issued right after launch can match it.
+ */
+export function exitTrailer(id: string, sessionFile: string): string {
+  const exitFile = shellEscape(`${sessionFile}.exit`);
+  return [
+    `__PI_SUBAGENT_EXIT_CODE=$?`,
+    `(exit "$__PI_SUBAGENT_EXIT_CODE"); ${sentinelEcho(id)}`,
+    `[ -f ${exitFile} ] || printf '%s' '{"type":"done","exitCode":'"$__PI_SUBAGENT_EXIT_CODE"'}' > ${exitFile}`,
+    `sleep 2`,
+  ].join("\n");
+}
+
+/**
  * Watch a pane for the exit sentinel using herdr's own `pane wait-output`,
  * which matches server-side and returns as soon as the line appears.
  *
@@ -884,13 +928,19 @@ export interface PollResult {
 }
 
 /**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
- *
- * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
+ * Interpret an `.exit` sidecar payload. Two writers share this file and this
+ * decoder:
+ *  - subagent-done.ts's error path (`type: "error"`, auto-retry exhausted,
+ *    provider overload, etc.) — no exitCode field, always reason "error".
+ *  - the launch script itself (`type: "done", exitCode: N`), written just
+ *    before the pane closes so pollForExit's fast path (which runs every tick
+ *    and reads this file before the sentinel watch) can see the real shell
+ *    exit code even on the rare poll that lands between the sentinel printing
+ *    and the pane disappearing.
+ * Centralized so both the fast and slow paths in pollForExit decode the
+ * payload the same way. Unknown shapes fall through to a clean done with exit
+ * code 0 — ask_question does NOT write this sidecar; it keeps the session open
+ * and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
  */
 function interpretExitSidecar(data: any): PollResult {
   if (data?.type === "error") {
@@ -900,7 +950,8 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  const exitCode = Number.isInteger(data?.exitCode) ? data.exitCode : 0;
+  return { reason: "done", exitCode };
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar, firstReportSeq };
