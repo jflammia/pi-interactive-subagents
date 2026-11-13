@@ -255,16 +255,23 @@ function getToolExtensionPath(tool: string): string | undefined {
 }
 
 /**
- * When this process was spawned as a restricted subagent, the parent pins the
- * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session, or an unrestricted child).
+ * The set of agents this process may spawn. A parent pins it for a child whose
+ * role grants spawning (`subagent_agents`) via PI_SUBAGENT_ALLOWED. `null` means
+ * no restriction, and only a top-level session gets that. Any other child
+ * (PI_SUBAGENT_ID is set for every child, on launch and on resume) gets the
+ * empty set: a role that omits `subagent_agents` cannot spawn at all, as the
+ * README states. Before this, an unrestricted role with no `subagent_agents`
+ * (no `tools:` line) loaded this extension and could spawn any agent, at any
+ * depth (live probe 2026-11-12: a `worker` child spawned a `scout`).
  */
-const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
-  const raw = process.env.PI_SUBAGENT_ALLOWED;
-  if (!raw) return null;
-  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length > 0 ? new Set(list) : null;
-})();
+export function resolveSubagentAllowlist(env: NodeJS.ProcessEnv): Set<string> | null {
+  const raw = env.PI_SUBAGENT_ALLOWED;
+  const list = (raw ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (list.length > 0) return new Set(list);
+  return env.PI_SUBAGENT_ID ? new Set() : null;
+}
+
+const SUBAGENT_ALLOWLIST: Set<string> | null = resolveSubagentAllowlist(process.env);
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -1806,6 +1813,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 let launchFaultForTests: string | null = null;
 
 export const __test__ = {
+  resolveSubagentAllowlist,
   childRecordedDone,
   setLaunchFaultForTests(message: string | null) {
     launchFaultForTests = message;

@@ -2068,6 +2068,15 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("resolveSubagentAllowlist: only a top-level session is unrestricted; a child with no grant can spawn nothing", () => {
+    const r = testApi.resolveSubagentAllowlist;
+    assert.equal(r({}), null, "top-level session: every agent");
+    assert.deepEqual([...r({ PI_SUBAGENT_ID: "abc" })], [], "child without subagent_agents (e.g. worker): none");
+    assert.deepEqual([...r({ PI_SUBAGENT_ID: "abc", PI_SUBAGENT_ALLOWED: " , " })], [], "an empty grant is no grant");
+    assert.deepEqual([...r({ PI_SUBAGENT_ID: "abc", PI_SUBAGENT_ALLOWED: "scout, researcher" })], ["scout", "researcher"]);
+    assert.deepEqual([...r({ PI_SUBAGENT_ALLOWED: "scout" })], ["scout"], "a pinned list binds even without an id");
+  });
+
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
