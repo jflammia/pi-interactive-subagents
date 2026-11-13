@@ -263,6 +263,12 @@ function getToolExtensionPath(tool: string): string | undefined {
  * README states. Before this, an unrestricted role with no `subagent_agents`
  * (no `tools:` line) loaded this extension and could spawn any agent, at any
  * depth (live probe 2026-11-12: a `worker` child spawned a `scout`).
+ *
+ * Known gap: herdr relaunches a pane after a server restart as plain
+ * `pi --session <path>` with no env, from the session reference the Herdr-owned
+ * extension reports. An unrestricted child loads that extension, so after a
+ * restart it runs as a top-level session again. Closing it needs the child to
+ * carry its identity in the session itself, not the environment.
  */
 export function resolveSubagentAllowlist(env: NodeJS.ProcessEnv): Set<string> | null {
   const raw = env.PI_SUBAGENT_ALLOWED;
@@ -2489,10 +2495,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
         //   • a top-level session → every discoverable agent, i.e. exactly what
         //     `subagents_list` shows.
-        // Every spawn must name an agent in that set. The lone exception is a
-        // top-level `fork: true` clone, which has no role and inherits the
-        // caller's own already-trusted toolset. Without this guard a missing or
-        // unknown `agent` silently launches an unrestricted, full-toolset child.
+        // Every spawn must name an agent in that set; there is no agentless spawn.
+        // Without this guard a missing or unknown `agent` silently launches an
+        // unrestricted, full-toolset child.
         const permittedAgents = SUBAGENT_ALLOWLIST
           ? [...SUBAGENT_ALLOWLIST]
           : discoverAgentDefinitions().map((a) => a.name);

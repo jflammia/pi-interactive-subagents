@@ -17,4 +17,8 @@ import { tmpdir } from "node:os";
 
 const agentDir = mkdtempSync(join(tmpdir(), "pi-subagents-agent-dir-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
+// The extension reads the subagent identity at import time (resolveSubagentAllowlist). A suite run
+// from inside a subagent pane inherits it and would see an empty allowlist: clear it so the suite
+// behaves as a top-level session on every machine (adversary 2026-11-12).
+for (const k of ["PI_SUBAGENT_ID", "PI_SUBAGENT_ALLOWED", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_NAME"]) delete process.env[k];
 process.on("exit", () => rmSync(agentDir, { recursive: true, force: true }));
