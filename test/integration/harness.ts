@@ -23,6 +23,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
+  currentBackend,
   isMuxAvailable,
   createSurface,
   createSurfaceSplit,
@@ -38,7 +39,7 @@ import {
   releaseAgentState,
   __forgetSubagentTab__ as forgetSubagentTab,
   type SurfacePlacement,
-} from "../../pi-extension/subagents/herdr.ts";
+} from "../../pi-extension/subagents/mux.ts";
 
 // Re-export herdr primitives for tests
 export {
@@ -87,11 +88,14 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether herdr is available in the current environment.
- * Returns ["herdr"] or [].
+ * Detect which mux backend this process would use, matching mux.ts's own
+ * selection (one backend per process — see mux.ts's module comment).
+ * Returns ["herdr"], ["rex"], or [] when neither is available.
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["herdr"] : [];
+  if (!isMuxAvailable()) return [];
+  const backend = currentBackend();
+  return backend === "none" ? [] : [backend];
 }
 
 /**
@@ -203,16 +207,23 @@ export function cleanupTestEnv(env: TestEnv): void {
   for (const surface of surfaces) {
     try {
       closeSurface(surface);
-    } catch {}
+    } catch {
+      // Best-effort teardown: the surface may already be gone (the test
+      // closed it itself, or the mux reaped it with its tab/window).
+    }
   }
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
-    } catch {}
+    } catch {
+      // Best-effort: the test may have already removed it.
+    }
   }
   try {
     rmSync(env.dir, { recursive: true, force: true });
-  } catch {}
+  } catch {
+    // Best-effort: nothing left to clean up if this already failed.
+  }
 }
 
 /**
@@ -302,14 +313,20 @@ export async function waitForScreen(
     try {
       const screen = await readScreenAsync(surface, lines);
       if (pattern.test(screen)) return screen;
-    } catch {}
+    } catch {
+      // Transient read failure (the agent may be mid-command); keep polling
+      // until the timeout below.
+    }
     await sleep(2000);
   }
 
   let finalScreen = "";
   try {
     finalScreen = readScreen(surface, lines);
-  } catch {}
+  } catch {
+    // Best-effort: show an empty screen in the timeout message below rather
+    // than failing this diagnostic read too.
+  }
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,
   );

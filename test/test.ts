@@ -4271,8 +4271,14 @@ describe("the resume handler unlinks a stale .exit sidecar before relaunching (s
     // package — see the comment at the unlinkSync call site in index.ts) is
     // still real and still needs a tripwire.
     const unlinkIndex = indexSource.indexOf("unlinkSync(`${sessionPath}.exit`)");
+    // Re-pinned 2026-11-14 for the Rex backend (#345): `command`/`trailer`
+    // are now passed to sendLongCommand separately (not pre-concatenated),
+    // so a mux backend can insert its own lines between the subagent's
+    // exit and exitTrailer's sentinel — see rex.ts's sendLongCommand. The
+    // invariant under test (unlink runs strictly before the resume command
+    // is assembled) is unchanged; only the literal assembly line moved.
     const commandBuildIndex = indexSource.indexOf(
-      "const command = `${resumeEnvPrefix}${parts.join(\" \")}\\n${exitTrailer(id, sessionPath)}`;",
+      'const resumeCommand = `${resumeEnvPrefix}${parts.join(" ")}`;',
     );
     assert.ok(unlinkIndex > 0, "expected to find the unlink call");
     assert.ok(commandBuildIndex > 0, "expected to find the resume command assembly");
