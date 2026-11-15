@@ -16,49 +16,31 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { isHerdrAvailable, herdrSetupHint } from "./herdr-rex-availability.ts";
 
 const execFileAsync = promisify(execFile);
 
 // ── Availability ──
+//
+// isHerdrAvailable lives in herdr-rex-availability.ts, shared with rex.ts and
+// mux.ts, so both backends' "am I running under my own multiplexer" check
+// stays defined in exactly one place each. Re-exported here unchanged so
+// nothing that already imports it from herdr.ts breaks.
+export { isHerdrAvailable };
 
-const commandAvailability = new Map<string, boolean>();
-
-function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
-  }
-
-  let available = false;
-  try {
-    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
-    available = true;
-  } catch {
-    available = false;
-  }
-
-  commandAvailability.set(command, available);
-  return available;
-}
-
-/**
- * True when running inside herdr with the herdr binary on PATH.
- * `HERDR_ENV=1` is set by herdr in every process it spawns.
- */
-export function isHerdrAvailable(): boolean {
-  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
-}
-
+/** @deprecated Use mux.ts's isMuxAvailable(), which also checks Rex. Kept so a direct herdr.ts import still answers "is *herdr* available", unchanged. */
 export function isMuxAvailable(): boolean {
   return isHerdrAvailable();
 }
 
+/** @deprecated Use mux.ts's muxSetupHint(), which also names the Rex path. */
 export function muxSetupHint(): string {
-  return "Start pi inside herdr (`herdr`, then run `pi` in a pane).";
+  return herdrSetupHint();
 }
 
 function requireHerdr(): void {
   if (!isHerdrAvailable()) {
-    throw new Error(`herdr is required for subagents. ${muxSetupHint()}`);
+    throw new Error(`herdr is required for subagents. ${herdrSetupHint()}`);
   }
 }
 
@@ -332,7 +314,10 @@ export function reportAgentState(
       "--seq", String(++reportSeq),
       ...(message ? ["--message", message.slice(0, 120)] : []),
     ]);
-  } catch {}
+  } catch {
+    // Best-effort, per this function's own doc comment above: a failed
+    // report must never disturb a running subagent.
+  }
 }
 
 /** Hand lifecycle authority for this pane back to herdr. */
@@ -343,7 +328,9 @@ export function releaseAgentState(surface: string, name: string): void {
       "--source", AGENT_SOURCE,
       "--agent", canonicalSubagentName(name),
     ]);
-  } catch {}
+  } catch {
+    // Best-effort, same as reportAgentState above.
+  }
 }
 
 /**
@@ -593,7 +580,9 @@ export function createSurface(
 function renameSurface(surface: string, name: string): void {
   try {
     herdrCli(["pane", "rename", surface, name]);
-  } catch {}
+  } catch {
+    // Cosmetic; never fatal.
+  }
 }
 
 /**
@@ -662,7 +651,7 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string; exec?: boolean },
+  options?: { scriptPath?: string; scriptPreamble?: string; exec?: boolean; trailer?: string },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -678,6 +667,16 @@ export function sendLongCommand(
     scriptParts.push(options.scriptPreamble.trimEnd());
   }
   scriptParts.push(command);
+  // `trailer` (typically exitTrailer's output) is a distinct seam from
+  // `command` so a backend can insert its own lines between the two —
+  // see rex.ts's sendLongCommand, which reports a boundary OSC 7501 state
+  // here, between the subagent's own exit and the sentinel/sidecar/sleep
+  // that exitTrailer writes. herdr.ts has nothing to insert, so this is
+  // just string concatenation, identical to the old caller-side
+  // `${command}\n${exitTrailer(...)}` composition.
+  if (options?.trailer) {
+    scriptParts.push(options.trailer);
+  }
 
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
@@ -719,7 +718,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
       encoding: "utf8",
     });
     if (stdout.trim() !== "") return stdout;
-  } catch {}
+  } catch {
+    // Same tolerance as readScreen's sync twin above: a recent-unwrapped read
+    // can error while the agent is mid-command, so fall through to the
+    // visible-screen read below rather than surfacing this.
+  }
   const fallback = await execFileAsync("herdr", readArgs(surface, lines, "visible"), {
     encoding: "utf8",
   });
@@ -1042,7 +1045,11 @@ export async function pollForExit(
       let finished = false;
       try {
         finished = options.childFinished?.() === true;
-      } catch {}
+      } catch {
+        // A throwing childFinished() must not be mistaken for "not finished":
+        // leave `finished` false and fall through to the error-path return
+        // below, same as if the callback had answered false.
+      }
       if (finished) return { reason: "done", exitCode: 0 };
       return {
         reason: "error",
@@ -1068,7 +1075,9 @@ export async function pollForExit(
     // terminate the thing it observes.
     try {
       options.onTick?.(elapsed);
-    } catch {}
+    } catch {
+      // See the comment immediately above: swallow by design.
+    }
 
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));

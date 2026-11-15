@@ -32,7 +32,7 @@ import {
   canonicalSubagentName,
   type SurfacePlacement,
   type AgentReportState,
-} from "./herdr.ts";
+} from "./mux.ts";
 
 import {
   countSessionEntryLines,
@@ -940,7 +940,7 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require herdr. ${muxSetupHint()}`,
+        text: `Subagents require herdr or Rex. ${muxSetupHint()}`,
       },
     ],
     details: { error: "herdr not available" },
@@ -1926,7 +1926,11 @@ async function launchSubagent(
     for (const surface of created.surfaces) {
       try {
         closeSurface(surface);
-      } catch {}
+      } catch {
+        // Best-effort cleanup on the way out of an already-failed launch:
+        // the surface may already be gone, and the real error is `err`,
+        // rethrown below.
+      }
     }
     for (const path of created.worktrees) finishWorktree(path);
     throw err;
@@ -2159,13 +2163,15 @@ async function launchSubagentInner(
   // still rides on the command — PI_SUBAGENT_SURFACE is the pane id, which does
   // not exist until the split has already happened.
   const piCommand = envPrefix + parts.join(" ");
-  const command = `${piCommand}\n${exitTrailer(id, subagentSessionFile)}`;
   const launchScriptName = `${params.name || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   // `exec`: replace the pane's shell with this script, so the pane closes
   // itself the moment the script ends (see sendLongCommand's `exec` doc and
   // exitTrailer's doc for why the sentinel+sidecar+sleep stay readable first).
-  sendLongCommand(surface, command, {
+  // `command`/`trailer` are kept separate, not pre-concatenated, so a mux
+  // backend can insert its own lines between the subagent's exit and
+  // exitTrailer's sentinel — see rex.ts's sendLongCommand for why.
+  sendLongCommand(surface, piCommand, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -2174,6 +2180,7 @@ async function launchSubagentInner(
       `# Surface: ${surface}`,
     ].join("\n"),
     exec: true,
+    trailer: exitTrailer(id, subagentSessionFile),
   });
 
   const running: RunningSubagent = {
@@ -2387,7 +2394,11 @@ async function watchSubagent(
     try {
       finishHerdrAgentState(running);
       closeSurface(surface);
-    } catch {}
+    } catch {
+      // Best-effort cleanup while already handling a watch failure: the
+      // surface may already be gone, and the real error is `err`, handled
+      // below.
+    }
     // A cancelled or crashed subagent may still have left work behind.
     const worktree = finishRunningWorktree(running);
     runningSubagents.delete(running.id);
@@ -3067,7 +3078,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // The pane was opened in the sub-agent's original cwd, so its tools
         // (safe_bash, edits) operate where they did before.
-        const command = `${resumeEnvPrefix}${parts.join(" ")}\n${exitTrailer(id, sessionPath)}`;
+        const resumeCommand = `${resumeEnvPrefix}${parts.join(" ")}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -3079,8 +3090,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
         // `exec`: same rationale as the fresh-spawn launch script — the pane
-        // closes itself when this resumed run ends.
-        sendLongCommand(surface, command, {
+        // closes itself when this resumed run ends. `command`/`trailer` kept
+        // separate — see the fresh-spawn call site's comment above.
+        sendLongCommand(surface, resumeCommand, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
@@ -3090,6 +3102,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
           exec: true,
+          trailer: exitTrailer(id, sessionPath),
         });
 
         // Register as a running subagent for widget tracking
