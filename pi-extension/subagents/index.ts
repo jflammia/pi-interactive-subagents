@@ -940,7 +940,7 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require herdr. ${muxSetupHint()}`,
+        text: `Subagents require herdr or Rex. ${muxSetupHint()}`,
       },
     ],
     details: { error: "herdr not available" },
