@@ -20,6 +20,7 @@ import {
   isHerdrAvailable,
   herdrSetupHint,
   isRexAvailable,
+  rexSessionSelector,
   rexSetupHint,
 } from "../pi-extension/subagents/herdr-rex-availability.ts";
 import * as mux from "../pi-extension/subagents/mux.ts";
@@ -148,21 +149,42 @@ describe("herdr-rex-availability.ts", () => {
     assert.equal(isHerdrAvailable(), false, "no HERDR_ENV means herdr is not available, binary or not");
   });
 
-  it("isRexAvailable requires TERM_PROGRAM=rex AND a non-empty REX_SESSION", () => {
+  it("isRexAvailable requires TERM_PROGRAM=rex AND a session selector (REX_SESSION or REX_BLOCK)", () => {
     clearMuxEnv();
     assert.equal(isRexAvailable(), false, "neither var set");
 
     process.env.TERM_PROGRAM = "rex";
-    assert.equal(isRexAvailable(), false, "TERM_PROGRAM alone, no REX_SESSION, is not enough");
+    assert.equal(isRexAvailable(), false, "TERM_PROGRAM alone, no selector, is not enough");
 
     process.env.REX_SESSION = "";
-    assert.equal(isRexAvailable(), false, "an empty REX_SESSION must not count as set");
+    process.env.REX_BLOCK = "";
+    assert.equal(isRexAvailable(), false, "empty REX_SESSION and REX_BLOCK must not count as set");
+
+    clearMuxEnv();
+    process.env.REX_BLOCK = "block:01a210b2-9732-787f-8a11-bc5257a5c197";
+    assert.equal(isRexAvailable(), false, "REX_BLOCK without TERM_PROGRAM=rex is not enough");
+    // The positive case depends on whether `rex` is on this test runner's
+    // PATH, so only the negative cases are asserted here; the selector
+    // itself is covered by the test below, and the positive case by the
+    // integration tests where `rex` is guaranteed present.
+  });
+
+  it("rexSessionSelector prefers REX_SESSION and falls back to REX_BLOCK (Rex 0.1.0-preview.23 sets no REX_SESSION)", () => {
+    clearMuxEnv();
+    assert.equal(rexSessionSelector(), undefined, "neither set");
+
+    process.env.REX_BLOCK = "block:01a210b2-9732-787f-8a11-bc5257a5c197";
+    assert.equal(rexSessionSelector(), "block:01a210b2-9732-787f-8a11-bc5257a5c197", "REX_BLOCK alone names the session");
+
+    process.env.REX_SESSION = "";
+    assert.equal(rexSessionSelector(), "block:01a210b2-9732-787f-8a11-bc5257a5c197", "an empty REX_SESSION falls through to REX_BLOCK");
 
     process.env.REX_SESSION = "session:01a1be15-e6ea-7d04-bf1b-11d078f9d48e";
-    // Whether this resolves true now depends on whether `rex` is on this
-    // test runner's PATH — assert only the negative cases above are stable
-    // without a live binary; the positive case is covered by integration
-    // tests where `rex` is guaranteed present.
+    assert.equal(rexSessionSelector(), "session:01a1be15-e6ea-7d04-bf1b-11d078f9d48e", "REX_SESSION wins when set");
+
+    process.env.REX_BLOCK = "";
+    process.env.REX_SESSION = "";
+    assert.equal(rexSessionSelector(), undefined, "both empty");
   });
 
   it("setup hints name each backend's own bootstrap command", () => {

@@ -25,7 +25,7 @@ export type MuxBackendName = "herdr" | "rex" | "none";
 
 /**
  * Decide once which backend this process uses. Rex is preferred when both
- * report available, because `REX_SESSION`/`TERM_PROGRAM=rex` are Rex's own
+ * report available, because `REX_SESSION` or `REX_BLOCK` with `TERM_PROGRAM=rex` are Rex's own
  * unambiguous markers (set only by Rex itself on every block it creates),
  * while `HERDR_ENV=1` could in principle survive into a Rex block spawned
  * from a nested shell that still carries it. Memoized: see the module

@@ -19,50 +19,13 @@ import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { chooseSplit, shellEscape, type AgentReportState, type SurfacePlacement } from "./herdr.ts";
+import { isRexAvailable, rexSessionSelector, rexSetupHint } from "./herdr-rex-availability.ts";
 
 const execFileAsync = promisify(execFile);
 
 // ── Availability ──
 
-const commandAvailability = new Map<string, boolean>();
-
-function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
-  }
-
-  let available = false;
-  try {
-    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
-    available = true;
-  } catch {
-    available = false;
-  }
-
-  commandAvailability.set(command, available);
-  return available;
-}
-
-/**
- * True when running inside a Rex block with both the session id and the
- * `rex` binary available. `TERM_PROGRAM=rex` plus `REX_SESSION` are what Rex
- * sets in every block it creates (observed on the installed Rex 0.1.0-preview
- * CLI); neither alone is enough — a nested shell could export a stale
- * `REX_SESSION` from a parent that has since exited, so the CLI's own
- * presence is checked too.
- */
-export function isRexAvailable(): boolean {
-  return (
-    process.env.TERM_PROGRAM === "rex" &&
-    typeof process.env.REX_SESSION === "string" &&
-    process.env.REX_SESSION !== "" &&
-    hasCommand("rex")
-  );
-}
-
-export function rexSetupHint(): string {
-  return "Run pi in a Rex block (`rex window new -- pi`), with REX_SESSION set.";
-}
+export { isRexAvailable, rexSetupHint };
 
 function requireRex(): void {
   if (!isRexAvailable()) {
@@ -72,8 +35,8 @@ function requireRex(): void {
 
 /** The session this process runs in. Only called after requireRex(). */
 function sessionId(): string {
-  const id = process.env.REX_SESSION;
-  if (!id) throw new Error("REX_SESSION is not set");
+  const id = rexSessionSelector();
+  if (!id) throw new Error("neither REX_SESSION nor REX_BLOCK is set");
   return id;
 }
 
