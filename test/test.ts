@@ -4872,6 +4872,70 @@ describe("gaps the mutation sweep exposed", () => {
     assert.equal(testApi.findBatchSpawnProblem([{ agent: "nosuch" }], load), null);
   });
 
+  it("refuses a batch before launching anything when a worktree task has no usable cwd", () => {
+    const defs: Record<string, any> = {
+      plain: { name: "plain" },
+      wt: { name: "wt", worktree: true },
+    };
+    const load = (a: string) => defs[a] ?? null;
+    const asked: string[] = [];
+    const blocker = (cwd: string) => {
+      asked.push(cwd);
+      return cwd === "/bare" ? "cannot create a worktree in /bare: fatal: this operation must be run in a work tree" : null;
+    };
+    const none = () => ({ paths: [] });
+    // agent-declared worktree, bad cwd: refused, naming the task
+    const msg = testApi.findBatchSpawnProblem(
+      [{ key: "a", agent: "plain", cwd: "/ok" }, { key: "b", agent: "wt", cwd: "/bare" }],
+      load, none, { defaultCwd: "/default", blocker },
+    );
+    assert.match(msg ?? "", /Task "b" \(agent "wt"\) needs a git worktree but cannot create a worktree in \/bare/);
+    // a plain agent without batch worktree is never probed
+    asked.length = 0;
+    assert.equal(testApi.findBatchSpawnProblem([{ key: "a", agent: "plain", cwd: "/bare" }], load, none, { defaultCwd: "/d", blocker }), null);
+    assert.deepEqual(asked, []);
+    // batch worktree:true probes every task; default cwd used when none given
+    assert.match(
+      testApi.findBatchSpawnProblem([{ key: "a", agent: "plain" }], load, none, { batchWorktree: true, defaultCwd: "/bare", blocker }) ?? "",
+      /Task "a".*\/bare/,
+    );
+    // explicit worktree:false does not suppress an agent-declared worktree (see README: only `true` is documented)
+    assert.match(
+      testApi.findBatchSpawnProblem([{ key: "b", agent: "wt", cwd: "/bare" }], load, none, { batchWorktree: false, defaultCwd: "/d", blocker }) ?? "",
+      /needs a git worktree/,
+    );
+  });
+
+  it("worktreeBlocker rejects a directory git cannot make a worktree in, and accepts a real work tree", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { execFileSync } = await import("node:child_process");
+    const { worktreeBlocker } = await import("../pi-extension/subagents/worktree.ts");
+    const dir = mkdtempSync(join(tmpdir(), "pi-wtblock-"));
+    try {
+      assert.match(worktreeBlocker(dir) ?? "", /cannot create a worktree in .*not a git repository/);
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      assert.equal(worktreeBlocker(dir), null);
+      execFileSync("git", ["config", "core.bare", "true"], { cwd: dir });
+      assert.match(worktreeBlocker(dir) ?? "", /work tree/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a mid-launch failure names what is still running, what failed and what never started", () => {
+    const text = testApi.formatPartialLaunch(
+      [{ key: "a", name: "a-1" }, { key: "b", name: "b-1" }],
+      { key: "c", error: "Failed to create worktree for subagent: boom" },
+      ["d", "e"],
+    );
+    assert.match(text, /launched 2 of 5/);
+    assert.match(text, /STILL RUNNING .*do NOT relaunch.*a: a-1, b: b-1/);
+    assert.match(text, /FAILED to launch: c — Failed to create worktree for subagent: boom/);
+    assert.match(text, /NOT started: d, e/);
+    assert.match(testApi.formatPartialLaunch([], { key: "a", error: "x" }, ["b"]), /No subagent was started/);
+  });
+
   it("treats a shapeless process-info reply as not busy", () => {
     // paneBusy gates a refusal, so anything it cannot interpret must fail open.
     for (const shapeless of [

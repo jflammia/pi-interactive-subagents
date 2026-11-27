@@ -69,7 +69,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { createWorktree, finishWorktree, reopenWorktree, worktreeNote } from "./worktree.ts";
+import { createWorktree, finishWorktree, reopenWorktree, worktreeBlocker, worktreeNote } from "./worktree.ts";
 import { extractStructuredOutput } from "./output-schema.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
@@ -1671,12 +1671,13 @@ function startStatusRefresh(pi: ExtensionAPI) {
  * throw inside launchSubagent has to be caught here first.
  */
 function findBatchSpawnProblem(
-  tasks: Array<{ agent: string; model?: string }>,
+  tasks: Array<{ key?: string; agent: string; model?: string; cwd?: string }>,
   loadDefs: (agent: string) => AgentDefaults | null = loadAgentDefaults,
   planFor: (
     params: Static<typeof SubagentParams>,
     defs: AgentDefaults | null,
   ) => { paths: string[] } | { error: string } = () => ({ paths: [] }),
+  worktreeCheck?: { batchWorktree?: boolean; defaultCwd: string; blocker: (cwd: string) => string | null },
 ): string | null {
   for (const task of tasks) {
     const defs = loadDefs(task.agent);
@@ -1694,8 +1695,34 @@ function findBatchSpawnProblem(
     }
     const plan = planFor({ agent: task.agent, task: "", model: task.model }, defs);
     if ("error" in plan) return `Agent "${task.agent}": ${plan.error}`;
+    // Same condition and same cwd launchSubagentInner uses to create a worktree.
+    if (worktreeCheck && (defs?.worktree || worktreeCheck.batchWorktree)) {
+      const cwd = resolveSubagentPaths({ cwd: task.cwd } as Static<typeof SubagentParams>, defs).effectiveCwd ?? worktreeCheck.defaultCwd;
+      const blocker = worktreeCheck.blocker(cwd);
+      if (blocker) {
+        return `Task${task.key ? ` "${task.key}"` : ""} (agent "${task.agent}") needs a git worktree but ${blocker}`;
+      }
+    }
   }
   return null;
+}
+
+/**
+ * What a caller is told when a launch throws partway through a batch.
+ * Names what is running (and stays running), what failed, and what never started,
+ * so the caller does not relaunch tasks that are already live.
+ */
+function formatPartialLaunch(
+  launched: Array<{ key: string; name: string }>,
+  failed: { key: string; error: string },
+  notStarted: string[],
+): string {
+  const started = launched.length
+    ? `STILL RUNNING (already started, do NOT relaunch): ${launched.map((l) => `${l.key}: ${l.name}`).join(", ")}. ` +
+      `Their results will arrive as steer messages.`
+    : `No subagent was started before the failure.`;
+  const rest = notStarted.length ? ` NOT started: ${notStarted.join(", ")}.` : "";
+  return `subagent_parallel launched ${launched.length} of ${launched.length + 1 + notStarted.length} tasks. ${started} FAILED to launch: ${failed.key} — ${failed.error}.${rest}`;
 }
 
 
@@ -1859,6 +1886,7 @@ export const __test__ = {
   registryEntryFor,
   childFinalMessage,
   findBatchSpawnProblem,
+  formatPartialLaunch,
   applySandboxToParts,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -3278,7 +3306,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           if ("error" in providerPlan) return providerPlan;
           const policyPlan = policyExtensionPlanFor(defs);
           return "error" in policyPlan ? policyPlan : { paths: [...providerPlan.paths, ...policyPlan.paths] };
-        });
+        }, { batchWorktree: params.worktree, defaultCwd: ctx.cwd, blocker: worktreeBlocker });
         if (batchProblem) {
           return {
             content: [{ type: "text" as const, text: batchProblem }],
@@ -3308,7 +3336,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Spawn each subagent. Surfaces are created sequentially (herdr pane
         // splits are fast ~4ms each), but the subagents run in parallel once
         // launched. The `worktree` param overrides each agent's own setting.
-        for (const t of params.tasks) {
+        for (const [taskIndex, t] of params.tasks.entries()) {
           const displayName = canonicalSubagentName(t.name || t.key);
           // Ensure uniqueness across running + registered names.
           const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
@@ -3371,6 +3399,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               });
 
             launched.push({ key: t.key, name: uniqueName, agent: t.agent });
+          } catch (err: any) {
+            // Earlier tasks are live and watched; say so rather than reporting a bare error.
+            const error = err?.message ?? String(err);
+            const notStarted = params.tasks.slice(taskIndex + 1).map((x) => x.key);
+            const text = formatPartialLaunch(launched, { key: t.key, error }, notStarted);
+            return {
+              content: [{ type: "text" as const, text }],
+              details: { launched, failed: { key: t.key, error }, notStarted, status: "partial", error: text },
+            };
           } finally {
             reservedNames.delete(uniqueName);
           }

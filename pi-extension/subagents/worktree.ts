@@ -31,6 +31,21 @@ function git(args: string[], opts: { cwd: string }): string {
 }
 
 /**
+ * Why a worktree could not be created from `repoCwd`, or null when it can.
+ * Runs the same `git rev-parse --show-toplevel` that `createWorktree` starts with,
+ * so a batch can refuse before launching anything instead of failing midway.
+ */
+export function worktreeBlocker(repoCwd: string): string | null {
+  try {
+    git(["rev-parse", "--show-toplevel"], { cwd: repoCwd });
+    return null;
+  } catch (err: any) {
+    const detail = String(err?.stderr || err?.message || err).trim().split("\n").pop();
+    return `cannot create a worktree in ${repoCwd}: ${detail}`;
+  }
+}
+
+/**
  * Create a worktree at `<repo>/.pi/worktrees/<name>-<short-id>` on a new branch
  * `pi-subagent/<name>-<short-id>` off the current HEAD.
  *
